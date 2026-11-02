@@ -1,0 +1,20 @@
+fxnkycat bass - VST3 bass chain plugin
+Windows, 64-bit
+
+INSTALL
+1. Close your DAW.
+2. Copy the "fxnkycat bass.vst3" folder from this zip into:
+       C:\Program Files\Common Files\VST3\
+   (Windows may ask for admin permission - click Continue.)
+3. Open your DAW and rescan plugins if it doesn't find it automatically.
+4. Look for "fxnkycat bass" by "catfxnk creative" in your effects list.
+
+Copy the whole "fxnkycat bass.vst3" folder, not just the file inside it.
+
+WHAT'S INSIDE
+Input HPF > Volume Rider > Comp-Gate > Problem EQ > De-Esser >
+Compressor > Pultec EQ (order switchable) > Tape > Delay > Filters,
+with a before/after spectrum analyzer and activity lights on every stage.
+Every stage starts OFF - switch on the ones you want.
+
+Tempo follows your project automatically.

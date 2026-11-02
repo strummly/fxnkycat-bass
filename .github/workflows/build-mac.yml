@@ -1,0 +1,60 @@
+# Builds the Mac version (VST3 + AU, universal: Apple Silicon + Intel).
+# Run it from the repository's Actions tab ("Run workflow"), or push to main.
+# The finished zip appears under the run's "Artifacts" section.
+name: Build Mac
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  mac:
+    # Intel Mac (Apple Silicon runners are often out of capacity); still builds a universal binary.
+    runs-on: macos-15-intel
+    env:
+      ART: build/BassChain_artefacts/Release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (downloads JUCE)
+        run: >
+          cmake -B build -G Xcode
+          -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
+
+      - name: Build
+        run: cmake --build build --config Release --parallel -- -quiet
+
+      - name: Check both architectures and ad-hoc sign
+        run: |
+          VST3="$ART/VST3/fxnkycat bass.vst3"
+          AU="$ART/AU/fxnkycat bass.component"
+          for b in "$VST3" "$AU"; do
+            lipo -info "$b"/Contents/MacOS/*
+            codesign --force --deep --sign - "$b"
+          done
+
+      - name: Validate the Audio Unit (auval)
+        continue-on-error: true
+        run: |
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          cp -R "$ART/AU/fxnkycat bass.component" ~/Library/Audio/Plug-Ins/Components/
+          killall -9 AudioComponentRegistrar || true
+          sleep 2
+          auval -v aufx FxBs Fxnk
+
+      - name: Package
+        run: |
+          mkdir -p "dist/fxnkycat bass"
+          cp -R "$ART/VST3/fxnkycat bass.vst3" "dist/fxnkycat bass/"
+          cp -R "$ART/AU/fxnkycat bass.component" "dist/fxnkycat bass/"
+          cp "installer/mac/HOW TO INSTALL.txt" "dist/fxnkycat bass/"
+          cd dist
+          # ditto keeps the Mac bundle structure and permissions intact
+          ditto -c -k --keepParent "fxnkycat bass" fxnkycat-bass-mac.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fxnkycat-bass-mac
+          path: dist/fxnkycat-bass-mac.zip
