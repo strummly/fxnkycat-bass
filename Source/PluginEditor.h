@@ -126,6 +126,9 @@ namespace ui
         // Text-only look: no box, selected word gold, the others grey (like the stage names).
         void setTextOnly (bool t) { textOnly = t; setMouseCursor (juce::MouseCursor::PointingHandCursor); repaint(); }
         void setUpperCase() { for (auto& o : options) o = o.toUpperCase(); repaint(); }   // show the options in capitals
+        // 0-1: lights the selected option's button from the left, like the knob meters.
+        void enableMeter() { meterEnabled = true; repaint(); }
+        void setMeter (float m) { if (std::abs (m - meter) > 0.004f || (m == 0.0f && meter != 0.0f)) { meter = m; repaint(); } }
         void mouseMove (const juce::MouseEvent&) override;
         void mouseExit (const juce::MouseEvent&) override;
     private:
@@ -133,6 +136,8 @@ namespace ui
         juce::StringArray options;
         int selected = 0, hoverSlot = -1;
         bool vertical = false, reversed = false, textOnly = false;
+        float meter = 0.0f;
+        bool  meterEnabled = false;
         juce::ParameterAttachment attachment;
     };
 
@@ -158,6 +163,8 @@ namespace ui
         void setActivity2 (float v);
         // Three bars side by side: left = setActivity2, middle = setActivity3, right = setActivity.
         void setTripleMeter (bool t) { tripleMeter = t; repaint(); }
+        // Hide the meter bars under the title (for stages whose knobs show their own meters).
+        void setShowMeterBars (bool b) { showBars = b; repaint(); }
         void setActivity3 (float v);
         void setNumber (const juce::String& n) { if (n != number) { number = n; repaint(); } }
         // Switches stacked in a column on the left, the last control (a knob) on the right.
@@ -174,7 +181,7 @@ namespace ui
         void turnOnFromControl (const juce::MouseEvent&);
         juce::Rectangle<float> meterArea() const;
         float activity = 0.0f, activity2 = 0.0f, activity3 = 0.0f;
-        bool  tripleMeter = false;
+        bool  tripleMeter = false, showBars = true;
         bool  splitMeter = false, ledFollowsBoth = false, ledFromSecond = false;
         juce::String number, title, subtitle;
         int rows;
@@ -195,6 +202,11 @@ private:
     using APVTS = juce::AudioProcessorValueTreeState;
 
     std::unique_ptr<ui::LabeledControl> knob (const char* id, const juce::String& caption);
+    // A knob that shows one of the processor's knob meters in its coloured arc.
+    std::unique_ptr<ui::LabeledControl> meteredKnob (const char* id, const juce::String& caption, int meterIndex);
+    juce::Slider* meterKnobs[BassChainProcessor::kNumKnobMeters] {};
+    float shownKnobMeter[BassChainProcessor::kNumKnobMeters] {};
+    ui::SegmentedSwitch* stereoSwitch = nullptr;   // Mono Below buttons (show the stereo meter)
     std::unique_ptr<ui::LabeledControl> toggle (const char* id, const juce::String& caption,
                                                 const juce::String& offText, const juce::String& onText);
     std::unique_ptr<ui::LabeledControl> choice (const char* id, const juce::String& caption);
@@ -215,6 +227,7 @@ private:
     // Parameter "swapHarm" = EQ first, so the light simply shows it.
     ui::LedButton swapLed;
     std::unique_ptr<juce::ParameterAttachment> swapAtt;
+    std::unique_ptr<juce::ParameterAttachment> peakAtt;   // Peak Reduction knob (shown inverted, right to left)
     bool swapped = false;
     void applySwap (bool s);
     juce::Slider inHpfSlider { juce::Slider::LinearHorizontal, juce::Slider::TextBoxRight };   // input high-pass

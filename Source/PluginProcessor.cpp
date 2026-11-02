@@ -46,7 +46,7 @@ juce::StringArray BassChainProcessor::insertPositionNames()
 {
     // By stage name. "After Harmonics" / "After Vintage EQ" follow those stages whichever
     // order HARMONIC/EQ SWAP puts them in. No "after Filters": that is just after the plugin.
-    return { "After Compressor", "After Harmonics", "After Vintage EQ", "After Limiter", "After Stereo" };
+    return { "Before Compressor", "After Compressor", "After Harmonics", "After Vintage EQ", "After Limiter", "After Stereo" };
 }
 
 BassChainProcessor::~BassChainProcessor()
@@ -230,7 +230,7 @@ APVTS::ParameterLayout BassChainProcessor::createLayout()
     l.add (bparam ("bypass", "Bypass", false));   // whole plugin; also the DAW's own bypass
     // External plugin insert: on/off and which stage it comes after
     l.add (bparam ("insertOn", "Insert On", false));   // switched on when a plugin is added
-    l.add (cparam ("insertPos", "Insert After", insertPositionNames(), 0));   // default: after the Compressor
+    l.add (cparam ("insertPos", "Insert After", insertPositionNames(), 1));   // default: after the Compressor
 
     // Global timing note value. Tempo itself comes from the project (host).
     l.add (cparam ("division", "Timing", divisionNames(), 6));   // default 1/4
@@ -245,6 +245,7 @@ APVTS::ParameterLayout BassChainProcessor::createLayout()
     l.add (fparam ("subBass", "Sub Bass", 0.0f, 100.0f, 0.0f, "%", 1.0f));
     l.add (fparam ("tapeAmount", "Tape", 0.0f, 100.0f, 0.0f, "%", 1.0f));
     l.add (fparam ("odMix", "Overdrive", 0.0f, 100.0f, 0.0f, "%", 1.0f));
+    l.add (fparam ("dryMix", "Dry", 0.0f, 100.0f, 0.0f, "%", 1.0f));   // clean signal straight into the limiter
 
     // 3. Vintage EQ (Pultec EQP-1A style)
     l.add (bparam ("pultecOn", "Pultec On", false));
@@ -303,6 +304,7 @@ BassChainProcessor::BassChainProcessor()
 
     compPeak    = p ("compPeak");    compRatio   = p ("compRatio");
     tapeAmount  = p ("tapeAmount");  subBass     = p ("subBass");     odMix     = p ("odMix");
+    dryMix      = p ("dryMix");
 
     pLowFreq   = p ("pLowFreq");   pLowBoost  = p ("pLowBoost");  pLowAtten    = p ("pLowAtten");
     pHighFreq  = p ("pHighFreq");  pHighBoost = p ("pHighBoost"); pBandwidth   = p ("pBandwidth");
@@ -338,7 +340,9 @@ void BassChainProcessor::prepareToPlay (double sr, int samplesPerBlock)
     tape.prepare (sr);
     subOctave.prepare (sr);
     fundDrive.prepare (sr);
-    lastSubAmt = lastOdAmt = 0.0f;
+    lastSubAmt = lastOdAmt = lastDryAmt = 0.0f;
+    for (auto& r : dryRing) r.assign ((size_t) (sr * 2.0) + kChunk * 2, 0.0f);   // dry path delay (up to ~2 s of plugin latency)
+    dryWritePos = 0;
     pultec.prepare (sr);
     limiter.prepare (sr);
     monoBelow.prepare (sr);
@@ -404,6 +408,8 @@ void BassChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
     limiter.setRelease (unit * 0.25);   // limiter release: a quarter of the Timing note (1/16 note at the default 1/4)
 
     float stageAct[kNumStages] {}, stageAct2[kNumStages] {}, stageAct3[kNumStages] {};
+    float km[kNumKnobMeters] {};   // knob meters, see KnobMeter
+    auto setKm = [&] (int i, float v) { km[i] = juce::jmax (km[i], v); };
 
     // Change in dB (relative to the input) -> 0-1, same scale as the static stages.
     auto changeAct = [] (float changeDb) { return juce::jlimit (0.0f, 1.0f, juce::jmap (changeDb, -40.0f, -10.0f, 0.0f, 1.0f)); };
@@ -428,7 +434,7 @@ void BassChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
         return changeAct (vc::effectDb (eIn, eOut, cross, len * nch));
     };
 
-    const int insAfter = juce::jlimit (0, 4, (int) insertPos->load());   // external plugin insert position
+    const int insAfter = juce::jlimit (0, 5, (int) insertPos->load());   // external plugin insert position
 
     // Process in chunks so per-stage measurement needs no allocation.
     for (int start = 0; start < n; start += kChunk)
@@ -457,17 +463,30 @@ void BassChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
         // External plugin insert: runs right after the stage chosen in "Insert After".
         auto insertAfter = [&] (int pos) { if (insAfter == pos) runInsert (ch, nch, len); };
 
+        // External plugin "Before Compressor", then the dry tap (the Dry knob in Harmonics).
+        insertAfter (0);
+        if (const int ringN = (int) dryRing[0].size(); ringN > 0)
+        {
+            for (int i = 0; i < len; ++i)
+            {
+                for (int c = 0; c < nch; ++c) dryRing[(size_t) c][(size_t) dryWritePos] = ch[c][i];
+                dryTapPos[i] = dryWritePos;
+                if (++dryWritePos == ringN) dryWritePos = 0;
+            }
+        }
+
         // 1. Opto compressor (meter shows gain reduction)
         if (on (compOn))
         {
             comp.process (ch, nch, len, compPeak->load(), 2.0f + (float) juce::jlimit (0, 2, (int) compRatio->load()));
+            setKm (kmComp, juce::jlimit (0.0f, 1.0f, comp.meter / 12.0f));   // Peak Reduction knob: gain reduction, full at 12 dB
             stageAct[0] = juce::jmax (stageAct[0], dynAct (comp.meter));
         }
-        insertAfter (0);
+        insertAfter (1);
 
         // 2/3. Harmonics: Sub Bass, Tape and Overdrive each process the stage's input on their own,
         // then are added together:  out = Tape(in) + sub x SubOctave(in) + overdrive x FundDrive(in).
-        // Two bars: left = tape (how much it changes the sound), right = sub + overdrive layers added.
+        // Each knob shows its own layer in its arc (see KnobMeter).
         auto runHarmonics = [&]
         {
             if (! on (colorOn)) return;
@@ -487,9 +506,10 @@ void BassChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
             subOctave.process (sub, nch, len, monoHz);   // -> sub octave layer only
             fundDrive.process (od, nch, len, odMix->load() * 0.01f, monoHz);   // -> distorted fundamental only
 
-            // Main path: tape (at 0 this is the untouched input). Middle meter.
-            stageAct3[1] = juce::jmax (stageAct3[1],
-                measureStatic (ch, nch, len, [&] { tape.process (ch, nch, len, tapeAmount->load(), false); }));
+            // Main path: tape (at 0 this is the untouched input). Its meter: what the tape changes.
+            const float tapeAct = measureStatic (ch, nch, len, [&] { tape.process (ch, nch, len, tapeAmount->load(), false); });
+            stageAct3[1] = juce::jmax (stageAct3[1], tapeAct);
+            setKm (kmTape, tapeAct);
 
             // Sum, with the knobs glided across the chunk so turning them doesn't click
             const float s1 = juce::jlimit (0.0f, 1.0f, subBass->load() * 0.01f);
@@ -511,8 +531,11 @@ void BassChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
             // How loud each added layer is, relative to the input
             auto layerDb = [&] (double e) { return eIn / (double) (len * nch) < 1.0e-7 ? -200.0f
                                                    : 10.0f * std::log10 ((float) (e / eIn) + 1.0e-12f); };
-            stageAct2[1] = juce::jmax (stageAct2[1], changeAct (layerDb (eSub)));   // left meter: sub bass
-            stageAct[1]  = juce::jmax (stageAct[1],  changeAct (layerDb (eOd)));    // right meter: overdrive
+            const float subAct = changeAct (layerDb (eSub)), odAct = changeAct (layerDb (eOd));
+            stageAct2[1] = juce::jmax (stageAct2[1], subAct);
+            stageAct[1]  = juce::jmax (stageAct[1],  odAct);
+            setKm (kmSub, subAct);        // Sub Bass knob: the sub signal
+            setKm (kmOverdrive, odAct);   // Overdrive knob: the overdriven signal
         };
 
         // 2/3. Vintage EQ
@@ -523,35 +546,77 @@ void BassChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
                            (int) pHighFreq->load(), pHighBoost->load(), pBandwidth->load(),
                            (int) pHighAttFreq->load(), pHighAtten->load());
             pultec.process (ch, nch, len);
-            // Two bars: left = low boost, right = high boost
-            float lowDb, highDb;
-            pultec.takeMeters (lowDb, highDb, len * nch);
-            stageAct2[2] = juce::jmax (stageAct2[2], changeAct (lowDb));
-            stageAct[2]  = juce::jmax (stageAct[2],  changeAct (highDb));
+            // Knob meters: the signal each boost adds and each attenuator takes away
+            float lbDb, laDb, hbDb, haDb;
+            pultec.takeMeters (lbDb, laDb, hbDb, haDb, len * nch);
+            setKm (kmLowBoost,  changeAct (lbDb));
+            setKm (kmLowAtten,  changeAct (laDb));
+            setKm (kmHighBoost, changeAct (hbDb));
+            setKm (kmHighAtten, changeAct (haDb));
+            stageAct2[2] = juce::jmax (stageAct2[2], changeAct (juce::jmax (lbDb, laDb)));   // panel LED
+            stageAct[2]  = juce::jmax (stageAct[2],  changeAct (juce::jmax (hbDb, haDb)));
         };
 
         // Order: Harmonics then Vintage EQ (default), or the EQ first when swapped
-        if (on (swapHarm)) { runPultec();    insertAfter (2); runHarmonics(); insertAfter (1); }
-        else               { runHarmonics(); insertAfter (1); runPultec();    insertAfter (2); }
+        if (on (swapHarm)) { runPultec();    insertAfter (3); runHarmonics(); insertAfter (2); }
+        else               { runHarmonics(); insertAfter (2); runPultec();    insertAfter (3); }
+
+        // Dry (Harmonics stage knob): the clean signal from the dry tap (after the input filters and a
+        // "Before Compressor" insert) joins here, skipping the compressor, Harmonics and Vintage EQ.
+        // It is delayed by the hosted plugin's latency when that plugin sits on the processed path
+        // between the tap and here, so the two stay lined up.
+        {
+            const int ringN = (int) dryRing[0].size();
+            int delay = 0;
+            if (insAfter >= 1 && insAfter <= 3) delay = juce::jlimit (0, ringN - kChunk - 1, getLatencySamples() - limiter.latency());
+            const float d1 = on (colorOn) ? juce::jlimit (0.0f, 1.0f, dryMix->load() * 0.01f) : 0.0f;
+            const float d0 = lastDryAmt;
+            lastDryAmt = d1;
+            if (ringN > 0 && (d1 > 0.0f || d0 > 0.0f))
+            {
+                double eOut = 0, eDry = 0;
+                for (int c = 0; c < nch; ++c)
+                    for (int i = 0; i < len; ++i)
+                    {
+                        int rp = dryTapPos[i] - delay;
+                        if (rp < 0) rp += ringN;
+                        const float add = (d0 + (d1 - d0) * (float) (i + 1) / (float) len) * dryRing[(size_t) c][(size_t) rp];
+                        eOut += (double) ch[c][i] * ch[c][i];
+                        eDry += (double) add * add;
+                        ch[c][i] += add;
+                    }
+                const float dryDb = eOut / (double) (len * nch) < 1.0e-7 && eDry / (double) (len * nch) < 1.0e-7 ? -200.0f
+                                  : 10.0f * std::log10 ((float) (eDry / juce::jmax (eOut, 1.0e-9)) + 1.0e-12f);
+                setKm (kmDry, changeAct (dryDb));   // Dry knob: the dry signal being added
+            }
+        }
 
         // 4. Limiter (always runs so its look-ahead delay is constant; only limits when on).
-        // Meter shows gain reduction.
         limiter.process (ch, nch, len, limThresh->load(), on (limOn));
+        if (on (limOn)) setKm (kmLimiter, juce::jlimit (0.0f, 1.0f, limiter.meter / 12.0f));   // Threshold knob: gain reduction, full at 12 dB
         stageAct[3] = juce::jmax (stageAct[3], dynAct (limiter.meter));
-        insertAfter (3);
+        insertAfter (4);
 
         // 5. Stereo: mono and centred below 200 / 250 / 300 Hz
         if (on (stereoOn))
         {
             monoBelow.process (ch, nch, len, (int) monoFreq->load());
-            stageAct[4] = juce::jmax (stageAct[4], changeAct (monoBelow.takeMeter (len * nch)));
+            const float stAct = changeAct (monoBelow.takeMeter (len * nch));   // low-end stereo folded to the centre
+            stageAct[4] = juce::jmax (stageAct[4], stAct);
+            setKm (kmStereo, stAct);
         }
-        insertAfter (4);
+        insertAfter (5);
 
         // 6. Filters: high / low pass
         if (on (filterOn))
-            stageAct[5] = juce::jmax (stageAct[5],
-                measureStatic (ch, nch, len, [&] { passFilters.process (ch, nch, len, hpFreq->load(), lpFreq->load()); }));
+        {
+            passFilters.process (ch, nch, len, hpFreq->load(), lpFreq->load());
+            float hpDb, lpDb;
+            passFilters.takeMeters (hpDb, lpDb, len * nch);
+            setKm (kmHighPass, changeAct (hpDb));   // High Pass knob: what it takes away
+            setKm (kmLowPass,  changeAct (lpDb));   // Low Pass knob: what it takes away
+            stageAct[5] = juce::jmax (stageAct[5], changeAct (juce::jmax (hpDb, lpDb)));   // stage light
+        }
 
         // Auto gain: follow input and output loudness (~1 s average) and trim the
         // output so it matches the input, within +/-18 dB. Holds during silence.
@@ -606,6 +671,11 @@ void BassChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
         while (stageAct2[s] > prev2 && ! activity2[s].compare_exchange_weak (prev2, stageAct2[s])) {}
         float prev3 = activity3[s].load();
         while (stageAct3[s] > prev3 && ! activity3[s].compare_exchange_weak (prev3, stageAct3[s])) {}
+    }
+    for (int k = 0; k < kNumKnobMeters; ++k)
+    {
+        float prevK = knobMeter[k].load();
+        while (km[k] > prevK && ! knobMeter[k].compare_exchange_weak (prevK, km[k])) {}
     }
 }
 

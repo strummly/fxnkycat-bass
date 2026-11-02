@@ -136,13 +136,14 @@ void SwitchButton::paintButton (juce::Graphics& g, bool highlighted, bool)
 void KnobLookAndFeel::drawRotarySlider (juce::Graphics& g, int x, int y, int w, int h, float pos,
                                         float startAngle, float endAngle, juce::Slider& s)
 {
-    if (! (bool) s.getProperties().getWithDefault ("fillRight", false))
-    {
-        LookAndFeel_V4::drawRotarySlider (g, x, y, w, h, pos, startAngle, endAngle, s);
-        return;
-    }
-
-    // Same look as LookAndFeel_V4, but the value arc runs from the pointer to the end.
+    // Same look as LookAndFeel_V4. The coloured value arc runs from the start to the pointer,
+    // or from the pointer to the end with "fillRight". A knob whose rotary angles are set
+    // end-before-start (Peak Reduction) turns right to left and fills from the right.
+    // A "meter" property (0-1) lights the coloured arc, from its fixed end towards the
+    // pointer, in the accent colour, by how much the knob's effect is adding or removing right now.
+    const bool  fillRight = (bool) s.getProperties().getWithDefault ("fillRight", false);
+    const float meter     = (float) s.getProperties().getWithDefault ("meter", 0.0f);
+    const bool  isMetered = s.getProperties().contains ("meter");
     const auto bounds = juce::Rectangle<int> (x, y, w, h).toFloat().reduced (10.0f);
     const float radius  = juce::jmin (bounds.getWidth(), bounds.getHeight()) / 2.0f;
     const float toAngle = startAngle + pos * (endAngle - startAngle);
@@ -155,12 +156,25 @@ void KnobLookAndFeel::drawRotarySlider (juce::Graphics& g, int x, int y, int w, 
     g.setColour (s.findColour (juce::Slider::rotarySliderOutlineColourId));
     g.strokePath (back, stroke);
 
-    if (s.isEnabled() && pos < 1.0f)
+    const float anchor = fillRight ? endAngle : startAngle;   // fixed end of the coloured arc
+    const bool  hasArc = fillRight ? pos < 1.0f : pos > 0.0f;
+    if (s.isEnabled() && hasArc)
     {
         juce::Path value;
-        value.addCentredArc (bounds.getCentreX(), bounds.getCentreY(), arcR, arcR, 0.0f, toAngle, endAngle, true);
-        g.setColour (s.findColour (juce::Slider::rotarySliderFillColourId));
+        value.addCentredArc (bounds.getCentreX(), bounds.getCentreY(), arcR, arcR, 0.0f, anchor, toAngle, true);
+        // Metered knobs: the arc is a dimmed accent, and the meter lights it in full accent.
+        const auto fill = s.findColour (juce::Slider::rotarySliderFillColourId);
+        g.setColour (isMetered ? fill.withAlpha (0.45f) : fill);
         g.strokePath (value, stroke);
+
+        if (meter > 0.005f)
+        {
+            juce::Path lit;
+            lit.addCentredArc (bounds.getCentreX(), bounds.getCentreY(), arcR, arcR, 0.0f,
+                               anchor, anchor + juce::jlimit (0.0f, 1.0f, meter) * (toAngle - anchor), true);
+            g.setColour (fill.brighter (0.35f));   // full (slightly bright) accent: the meter
+            g.strokePath (lit, stroke);
+        }
     }
 
     const float thumbW = lineW * 2.0f;
@@ -233,8 +247,17 @@ void SegmentedSwitch::paint (juce::Graphics& g)
                             : juce::Rectangle<float> (r.getX() + w * (float) s, r.getY(), w, r.getHeight());
         if (i == selected)
         {
-            g.setColour (accent);
+            // With a meter (Stereo stage): the button is a dimmed accent, lit up in full accent
+            // from the left by the meter, like the knob meters.
+            const bool metered = meterEnabled;
+            g.setColour (metered ? accent.withAlpha (0.45f) : accent);
             g.fillRoundedRectangle (seg.reduced (2.0f), 4.0f);
+            if (metered && meter > 0.005f)
+            {
+                auto lit = seg.reduced (2.0f);
+                g.setColour (accent.brighter (0.35f));
+                g.fillRoundedRectangle (lit.withWidth (lit.getWidth() * juce::jlimit (0.0f, 1.0f, meter)), 4.0f);
+            }
         }
         g.setColour (i == selected ? bg : dimText);
         g.drawFittedText (options[i], seg.toNearestInt(), juce::Justification::centred, 1);
@@ -645,7 +668,8 @@ void ModulePanel::paint (juce::Graphics& g)
             g.fillRoundedRectangle (m.withWidth (m.getWidth() * v), 1.5f);
         }
     };
-    if (tripleMeter)
+    if (! showBars) {}   // knobs show this stage's meters
+    else if (tripleMeter)
     {
         // Three bars: left = activity2, middle = activity3, right = activity
         auto m = meterArea();
@@ -742,7 +766,7 @@ void ModulePanel::resized()
 BassChainEditor::BassChainEditor (BassChainProcessor& p)
     : AudioProcessorEditor (p), proc (p),
       comp      ("1", "Opto Comp",  "LA-2A style  |  tempo release  |  gain matched", 1),
-      harmonics ("2", "Harmonics",  "Sub octave  |  tape  |  overdrive, in parallel", 1),
+      harmonics ("2", "Harmonics",  "Tape  |  overdrive  |  sub in parallel  |  dry", 2),
       pultec    ("3", "Vintage EQ", "EQP-1A style program equalizer", 2),
       limiter   ("4", "Limiter",    "Brickwall  |  release follows tempo", 1),
       stereo    ("5", "Stereo",     "Mono and centred below", 1),
@@ -776,38 +800,77 @@ BassChainEditor::BassChainEditor (BassChainProcessor& p)
         lc->setControlHeight (96);
         comp.add (std::move (lc));
     }
-    comp.add (knob ("compPeak", "Peak Reduction"));
+    {
+        // Peak Reduction runs right to left: 0 at the right end, more reduction further left,
+        // with its coloured arc growing from the right. The knob itself holds (100 - value),
+        // so its normal drag works the right way round: drag down = left = more reduction,
+        // drag up = right = less. The text box still shows the real value.
+        auto s = std::make_unique<juce::Slider> (juce::Slider::RotaryHorizontalVerticalDrag, juce::Slider::TextBoxBelow);
+        s->setTextBoxStyle (juce::Slider::TextBoxBelow, false, 80, 20);
+        s->setRange (0.0, 100.0, 1.0);
+        s->textFromValueFunction = [] (double v) { return juce::String (juce::roundToInt (100.0 - v)); };
+        s->valueFromTextFunction = [] (const juce::String& t) { return 100.0 - juce::jlimit (0.0, 100.0, t.getDoubleValue()); };
+        s->setDoubleClickReturnValue (true, 100.0);   // = Peak Reduction 0
+        s->getProperties().set ("fillRight", true);
+        s->getProperties().set ("meter", 0.0f);
+        auto* sp = s.get();
+        meterKnobs[BassChainProcessor::kmComp] = sp;
+        if (auto* prm = proc.apvts.getParameter ("compPeak"))
+        {
+            peakAtt = std::make_unique<juce::ParameterAttachment> (*prm, [sp] (float v)
+            {
+                sp->setValue (100.0 - v, juce::dontSendNotification);
+            });
+            sp->onDragStart   = [this] { peakAtt->beginGesture(); };
+            sp->onDragEnd     = [this] { peakAtt->endGesture(); };
+            sp->onValueChange = [this, sp]
+            {
+                if (sp->isMouseButtonDown()) peakAtt->setValueAsPartOfGesture ((float) (100.0 - sp->getValue()));
+                else                         peakAtt->setValueAsCompleteGesture ((float) (100.0 - sp->getValue()));
+            };
+            peakAtt->sendInitialUpdate();
+        }
+        comp.add (std::make_unique<ui::LabeledControl> ("Peak Reduction", std::move (s), false));
+    }
     comp.setSideStack (true);
     bindEnable (comp, "compOn");
+    comp.setShowMeterBars (false);        // the Peak Reduction knob shows the gain reduction
 
-    // 2. Harmonics: Sub Bass, Tape and Overdrive side by side (each runs on its own, then they are summed)
-    harmonics.add (knob ("subBass", "Sub Bass"));
-    harmonics.add (knob ("tapeAmount", "Tape"));
-    harmonics.add (knob ("odMix", "Overdrive"));
+    // 2. Harmonics, two by two: Tape and Overdrive on top, Sub Bass and Dry below.
+    // Sub, Tape and Overdrive each run on their own and are summed; Dry skips ahead to the Limiter.
+    harmonics.add (meteredKnob ("tapeAmount", "Tape", BassChainProcessor::kmTape));
+    harmonics.add (meteredKnob ("odMix", "Overdrive", BassChainProcessor::kmOverdrive));
+    harmonics.add (meteredKnob ("subBass", "Sub Bass", BassChainProcessor::kmSub));
+    harmonics.add (meteredKnob ("dryMix", "Dry", BassChainProcessor::kmDry));   // clean signal straight into the limiter
     harmonics.setSplitMeter (true, true);
     harmonics.setTripleMeter (true);   // three bars, one per knob: sub bass, tape, overdrive
     bindEnable (harmonics, "colorOn");
+    harmonics.setShowMeterBars (false);   // each knob shows its own meter
 
     // 3. Vintage EQ — laid out like the hardware: low section on top, high section below.
     pultec.add (choice ("pLowFreq", "Low Freq (CPS)"));
-    pultec.add (knob ("pLowBoost", "Low Boost"));
-    pultec.add (knob ("pLowAtten", "Low Atten"));
+    pultec.add (meteredKnob ("pLowBoost", "Low Boost", BassChainProcessor::kmLowBoost));
+    pultec.add (meteredKnob ("pLowAtten", "Low Atten", BassChainProcessor::kmLowAtten));
     pultec.add (choice ("pHighAttFreq", "Atten Sel (KCS)"));
     pultec.add (choice ("pHighFreq", "High Freq (KCS)"));
-    pultec.add (knob ("pHighBoost", "High Boost"));
+    pultec.add (meteredKnob ("pHighBoost", "High Boost", BassChainProcessor::kmHighBoost));
     pultec.add (knob ("pBandwidth", "Bandwidth (Sharp-Broad)"));
-    pultec.add (knob ("pHighAtten", "High Atten"));
+    pultec.add (meteredKnob ("pHighAtten", "High Atten", BassChainProcessor::kmHighAtten));
     pultec.setSplitMeter (true, true);   // left bar: low boost, right bar: high boost
     bindEnable (pultec, "pultecOn");
+    pultec.setShowMeterBars (false);      // each boost / atten knob shows its own meter
 
     // 4. Limiter: threshold only (release follows the tempo)
-    limiter.add (knob ("limThresh", "Threshold"));
+    limiter.add (meteredKnob ("limThresh", "Threshold", BassChainProcessor::kmLimiter));
     bindEnable (limiter, "limOn");
+    limiter.setShowMeterBars (false);   // the Threshold knob shows the gain reduction
 
     // 5. Stereo: mono below 200 | 250 | 300 Hz
     if (auto* mf = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("monoFreq")))
     {
         auto sw = std::make_unique<ui::SegmentedSwitch> (*mf);
+        stereoSwitch = sw.get();
+        sw->enableMeter();
         sw->setVertical (true);
         sw->setReversed (true);   // 300 Hz on top, 200 Hz at the bottom
         auto lc = std::make_unique<ui::LabeledControl> ("Mono Below", std::move (sw), true, 90);
@@ -815,11 +878,15 @@ BassChainEditor::BassChainEditor (BassChainProcessor& p)
         stereo.add (std::move (lc));
     }
     bindEnable (stereo, "stereoOn");
+    stereo.setShowMeterBars (false);    // the selected button shows the meter
 
     // 6. Filters: high / low pass
-    filters.add (knob ("hpFreq", "High Pass"));
-    filters.add (knob ("lpFreq", "Low Pass"));
+    filters.add (meteredKnob ("hpFreq", "High Pass", BassChainProcessor::kmHighPass));
+    filters.add (meteredKnob ("lpFreq", "Low Pass", BassChainProcessor::kmLowPass));
+    if (auto* lp = meterKnobs[BassChainProcessor::kmLowPass])
+        lp->getProperties().set ("fillRight", true);   // coloured arc = the part being cut (pointer to the right end)
     bindEnable (filters, "filterOn");
+    filters.setShowMeterBars (false);   // each knob shows what its filter takes away
 
     for (auto* panel : { &comp, &harmonics, &pultec, &limiter, &stereo, &filters })
         addAndMakeVisible (panel);
@@ -941,6 +1008,28 @@ void BassChainEditor::timerCallback()
         shownActivity3[s] = juce::jmax (proc.activity3[s].exchange (0.0f), shownActivity3[s] * 0.82f);
         if (shownActivity3[s] < 0.01f) shownActivity3[s] = 0.0f;
         panels[s]->setActivity3 (shownActivity3[s]);
+    }
+
+    // Knob meters: jump up instantly, fade out over roughly a quarter second.
+    for (int k = 0; k < BassChainProcessor::kNumKnobMeters; ++k)
+    {
+        auto* s = meterKnobs[k];
+        if (k == BassChainProcessor::kmStereo)
+        {
+            shownKnobMeter[k] = juce::jmax (proc.knobMeter[k].exchange (0.0f), shownKnobMeter[k] * 0.82f);
+            if (shownKnobMeter[k] < 0.01f) shownKnobMeter[k] = 0.0f;
+            if (stereoSwitch != nullptr) stereoSwitch->setMeter (shownKnobMeter[k]);
+            continue;
+        }
+        if (s == nullptr) continue;
+        const float shown = juce::jmax (proc.knobMeter[k].exchange (0.0f), shownKnobMeter[k] * 0.82f);
+        const float v = shown < 0.01f ? 0.0f : shown;
+        if (std::abs (v - shownKnobMeter[k]) > 0.004f || (v == 0.0f && shownKnobMeter[k] != 0.0f))
+        {
+            s->getProperties().set ("meter", v);
+            s->repaint();
+        }
+        shownKnobMeter[k] = v;
     }
 
 
@@ -1463,10 +1552,22 @@ BassChainEditor::~BassChainEditor()
         makerThread->stopThread (4000);        // stop reading makers; keep what was read
         makers().save();
     }
+    peakAtt.reset();
     sliderAtts.clear();
     buttonAtts.clear();
     comboAtts.clear();
     setLookAndFeel (nullptr);
+}
+
+std::unique_ptr<ui::LabeledControl> BassChainEditor::meteredKnob (const char* id, const juce::String& caption, int meterIndex)
+{
+    auto lc = knob (id, caption);
+    if (auto* s = dynamic_cast<juce::Slider*> (&lc->get()))
+    {
+        s->getProperties().set ("meter", 0.0f);
+        meterKnobs[meterIndex] = s;
+    }
+    return lc;
 }
 
 std::unique_ptr<ui::LabeledControl> BassChainEditor::knob (const char* id, const juce::String& caption)

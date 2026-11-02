@@ -60,6 +60,12 @@ public:
     std::atomic<float> activity2[kNumStages] {};
     std::atomic<float> activity3[kNumStages] {};   // third (middle) meter: harmonics = tape
 
+    // Meters drawn inside the knobs' coloured arcs, 0-1 (peak since the editor last read it).
+    // Each shows only what that knob's own effect adds or removes.
+    enum KnobMeter { kmComp, kmSub, kmTape, kmOverdrive, kmLowBoost, kmLowAtten, kmHighBoost, kmHighAtten,
+                     kmLimiter, kmHighPass, kmLowPass, kmStereo, kmDry, kNumKnobMeters };
+    std::atomic<float> knobMeter[kNumKnobMeters] {};
+
     BassChainProcessor();
     ~BassChainProcessor() override;
 
@@ -130,7 +136,7 @@ private:
     // 1 Opto compressor
     std::atomic<float> *compPeak, *compRatio;
     // 2 Harmonics: sub bass, tape, overdrive (parallel)
-    std::atomic<float> *subBass, *tapeAmount, *odMix;
+    std::atomic<float> *subBass, *tapeAmount, *odMix, *dryMix;
     // 3 Vintage EQ (Pultec)
     std::atomic<float> *pLowFreq, *pLowBoost, *pLowAtten, *pHighFreq, *pHighBoost,
                        *pBandwidth, *pHighAttFreq, *pHighAtten;
@@ -152,7 +158,10 @@ private:
 
     static constexpr int kChunk = 512;
     std::array<std::array<float, kChunk>, vc::kMaxCh> stageIn {}, subBuf {}, odBuf {};   // scratch (no allocation)
-    float lastSubAmt = 0.0f, lastOdAmt = 0.0f;   // Sub Bass / Overdrive knobs last chunk (for gliding)
+    float lastSubAmt = 0.0f, lastOdAmt = 0.0f, lastDryAmt = 0.0f;   // Sub Bass / Overdrive / Dry knobs last chunk (for gliding)
+    std::vector<float> dryRing[vc::kMaxCh];   // dry path: tapped after the input filters, read before the limiter
+    int dryWritePos = 0;
+    std::array<int, kChunk> dryTapPos {};      // where each sample of this chunk was written
 
     vc::OptoComp       comp;
     vc::InputHighPass  inputHpf;

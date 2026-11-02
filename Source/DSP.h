@@ -247,9 +247,9 @@ struct PultecEQ
         highAtten.makeHighShelf (fs, af, 0.6, -highAttenAmt * 1.6);        // up to -16 dB
     }
 
-    // Energy of the input, and of what the low and high boost sections each add,
-    // summed since the last takeMeters() (for the stage's two meter bars).
-    double eIn = 0, eLowAdd = 0, eHighAdd = 0;
+    // Energy of the input, and of what each of the four sections adds (boosts) or
+    // takes away (attenuators), summed since the last takeMeters() (for the knob meters).
+    double eIn = 0, eLowAdd = 0, eLowCut = 0, eHighAdd = 0, eHighCut = 0;
 
     void process (float* const* ch, int nch, int n)
     {
@@ -263,25 +263,24 @@ struct PultecEQ
                 const float lb = lowBoost.process (x, c);
                 eLowAdd += (double) (lb - x) * (lb - x);
                 x = lowAtten.process (lb, c);
+                eLowCut += (double) (x - lb) * (x - lb);
                 const float hb = highBoost.process (x, c);
                 eHighAdd += (double) (hb - x) * (hb - x);
                 x = highAtten.process (hb, c);
+                eHighCut += (double) (x - hb) * (x - hb);
                 d[i] = x;
             }
         }
     }
 
-    // How much each boost changes the sound, in dB relative to the input
-    // (-inf if silent). Resets the sums.
-    void takeMeters (float& lowDb, float& highDb, int samples)
+    // How loud the signal each section adds or removes is, in dB relative to the input
+    // (-200 if silent). Resets the sums.
+    void takeMeters (float& lowBoostDb, float& lowAttenDb, float& highBoostDb, float& highAttenDb, int samples)
     {
-        if (eIn / std::max (1, samples) < 1.0e-7) { lowDb = highDb = -200.0f; }   // near-silence
-        else
-        {
-            lowDb  = 10.0f * std::log10 ((float) (eLowAdd  / eIn) + 1.0e-12f);
-            highDb = 10.0f * std::log10 ((float) (eHighAdd / eIn) + 1.0e-12f);
-        }
-        eIn = eLowAdd = eHighAdd = 0;
+        auto db = [&] (double e) { return 10.0f * std::log10 ((float) (e / eIn) + 1.0e-12f); };
+        if (eIn / std::max (1, samples) < 1.0e-7) lowBoostDb = lowAttenDb = highBoostDb = highAttenDb = -200.0f;   // near-silence
+        else { lowBoostDb = db (eLowAdd); lowAttenDb = db (eLowCut); highBoostDb = db (eHighAdd); highAttenDb = db (eHighCut); }
+        eIn = eLowAdd = eLowCut = eHighAdd = eHighCut = 0;
     }
 };
 
@@ -389,10 +388,28 @@ struct PassFilters
             float* d = ch[c];
             for (int i = 0; i < n; ++i)
             {
+                eIn += (double) d[i] * d[i];
                 const float x = useHp ? hp2.process (hp1.process (d[i], c), c) : d[i];
+                eMid += (double) x * x;
                 d[i] = lp2.process (lp1.process (x, c), c);
+                eOut += (double) d[i] * d[i];
             }
         }
+    }
+
+    // How much each filter takes away (energy lost, so phase shifts don't count), in dB
+    // relative to the input; -200 if nothing or silent. Resets the sums.
+    double eIn = 0, eMid = 0, eOut = 0;
+    void takeMeters (float& hpDb, float& lpDb, int samples)
+    {
+        auto lost = [&] (double before, double after)
+        {
+            return eIn / std::max (1, samples) < 1.0e-7 || before <= after ? -200.0f
+                 : 10.0f * std::log10 ((float) ((before - after) / eIn) + 1.0e-12f);
+        };
+        hpDb = lost (eIn, eMid);
+        lpDb = lost (eMid, eOut);
+        eIn = eMid = eOut = 0;
     }
 };
 
@@ -565,9 +582,10 @@ struct SubOctave
 };
 
 // Saturation layer (the "Overdrive" knob, 0-100 % = how much is added).
-// Only the fundamental is saturated: it is taken at a steady level and pushed gently
-// (+6 dB) into a soft, slightly biased tube-style curve, which rounds the wave and adds
-// mostly low, warm harmonics (2nd, 3rd, 4th...) rather than the buzz of hard clipping.
+// Only the fundamental is driven: it is taken at a steady level and pushed (+10.5 dB)
+// into a soft, biased tube-style curve - between a gentle saturation and a hard
+// overdrive - which brings out a clear harmonic series (strong warm 2nd, then 3rd, 5th...)
+// while the high, scratchy harmonics stay low, so it stays clean rather than fuzzy.
 // Only part of what comes out is kept (gentle 12 dB/oct filters each side):
 //   - High-pass at the Stereo stage's Mono Below frequency (200 / 250 / 300 Hz), so the
 //     layer stays out of the mono low end. It follows that setting even when the
@@ -579,9 +597,9 @@ struct SubOctave
 struct FundDrive
 {
     static constexpr double kLpTopHz = 2000.0, kLpBottomHz = 800.0;
-    static constexpr float  kDriveDb = 6.0f;
-    static constexpr float  kBias    = 0.2f;   // slight asymmetry -> warm even harmonics
-    static constexpr float  kLevel   = 2.5f;   // at 100 %: the layer peaks about as high as the note (less on very low notes)
+    static constexpr float  kDriveDb = 10.5f;
+    static constexpr float  kBias    = 0.3f;   // asymmetry -> warm even harmonics
+    static constexpr float  kLevel   = 1.8f;   // at 100 %: the layer peaks about as high as the note (less on very low notes)
 
     FundamentalTracker trk;
     Biquad hp, lp;   // 12 dB/oct each
