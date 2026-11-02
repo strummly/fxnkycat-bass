@@ -12,9 +12,10 @@ INSTALL
 Copy the whole "fxnkycat bass.vst3" folder, not just the file inside it.
 
 WHAT'S INSIDE
-Input HPF > Volume Rider > Comp-Gate > Problem EQ > De-Esser >
-Compressor > Pultec EQ (order switchable) > Tape > Delay > Filters,
-with a before/after spectrum analyzer and activity lights on every stage.
+Input HPF / LPF > Opto Comp > Harmonics (sub bass, tape, overdrive) >
+Vintage EQ (order with Harmonics switchable) > Limiter > Stereo > Filters,
+with a before/after spectrum analyzer, an external VST3 insert slot,
+and activity meters on every stage.
 Every stage starts OFF - switch on the ones you want.
 
 Tempo follows your project automatically.
