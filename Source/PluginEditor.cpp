@@ -572,6 +572,14 @@ void ModulePanel::setActivity2 (float v)
     repaint (meterArea().expanded (2.0f).getSmallestIntegerContainer());
 }
 
+void ModulePanel::setActivity3 (float v)
+{
+    if (std::abs (v - activity3) < 0.004f) return;
+    activity3 = v;
+    repaint (ledArea().expanded (8.0f).getSmallestIntegerContainer());
+    repaint (meterArea().expanded (2.0f).getSmallestIntegerContainer());
+}
+
 void ModulePanel::turnOnFromControl (const juce::MouseEvent& e)
 {
     // Only for the user's own clicks / scrolls on a control in this stage, so presets,
@@ -614,7 +622,8 @@ void ModulePanel::paint (juce::Graphics& g)
     const float a  = isOn ? activity : 0.0f;
     const float a2 = isOn && (splitMeter || ledFromSecond) ? activity2 : 0.0f;
     const juce::Colour hot { 0xffff7a3d };
-    const float la = ledFromSecond ? a2 : (ledFollowsBoth ? juce::jmax (a, a2) : a);
+    float la = ledFromSecond ? a2 : (ledFollowsBoth ? juce::jmax (a, a2) : a);
+    if (tripleMeter && isOn) la = juce::jmax (a, a2, activity3);   // LED follows whichever bar is highest
     if (la > 0.02f)
     {
         g.setColour (hot.withAlpha (0.35f * la));
@@ -636,7 +645,18 @@ void ModulePanel::paint (juce::Graphics& g)
             g.fillRoundedRectangle (m.withWidth (m.getWidth() * v), 1.5f);
         }
     };
-    if (splitMeter)
+    if (tripleMeter)
+    {
+        // Three bars: left = activity2, middle = activity3, right = activity
+        auto m = meterArea();
+        constexpr float barGap = 8.0f;
+        const float third = (m.getWidth() - 2.0f * barGap) / 3.0f;
+        drawBar (m.removeFromLeft (third), a2);
+        m.removeFromLeft (barGap);
+        drawBar (m.removeFromLeft (third), isOn ? activity3 : 0.0f);
+        drawBar (m.removeFromRight (third), a);
+    }
+    else if (splitMeter)
     {
         auto m = meterArea();
         constexpr float barGap = 8.0f;
@@ -721,8 +741,8 @@ void ModulePanel::resized()
 //==============================================================================
 BassChainEditor::BassChainEditor (BassChainProcessor& p)
     : AudioProcessorEditor (p), proc (p),
-      rider     ("1", "Rider",      "Rides to target  |  noise floor  |  3 speeds", 1),
-      harmonics ("2", "Harmonics",  "Tape saturation  |  harmonic exciter", 1),
+      comp      ("1", "Opto Comp",  "LA-2A style  |  tempo release  |  gain matched", 1),
+      harmonics ("2", "Harmonics",  "Sub octave  |  tape  |  overdrive, in parallel", 1),
       pultec    ("3", "Vintage EQ", "EQP-1A style program equalizer", 2),
       limiter   ("4", "Limiter",    "Brickwall  |  release follows tempo", 1),
       stereo    ("5", "Stereo",     "Mono and centred below", 1),
@@ -745,21 +765,27 @@ BassChainEditor::BassChainEditor (BassChainProcessor& p)
     loadAccent();   // saved accent colour (first window of the session)
 
     analyzer.setWatermark (juce::ImageCache::getFromMemory (BinaryData::logo_png, BinaryData::logo_pngSize), "FXNKYCAT BASS");
-    // 1. Rider: speed mode across the top, then noise floor and target.
-    if (auto* mode = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("riderMode")))
-        rider.add (std::make_unique<ui::LabeledControl> ("Speed", std::make_unique<ui::SegmentedSwitch> (*mode), true, 400));
-    rider.add (knob ("riderThresh", "Noise Floor"));
-    rider.add (knob ("riderTarget", "Target Loudness"));
-    rider.setTopWide (true);
-    rider.setSplitMeter (true);   // left bar: level over the noise floor, right bar: how much it moves the level
-    bindEnable (rider, "riderOn");
+    // 1. Opto compressor: ratio switch on the left, Peak Reduction knob on the right
+    if (auto* ratio = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("compRatio")))
+    {
+        // Stacked: 4:1 on top, 3:1 (default) in the middle, 2:1 at the bottom
+        auto sw = std::make_unique<ui::SegmentedSwitch> (*ratio);
+        sw->setVertical (true);
+        sw->setReversed (true);
+        auto lc = std::make_unique<ui::LabeledControl> ("Ratio", std::move (sw), true, 70);
+        lc->setControlHeight (96);
+        comp.add (std::move (lc));
+    }
+    comp.add (knob ("compPeak", "Peak Reduction"));
+    comp.setSideStack (true);
+    bindEnable (comp, "compOn");
 
-    // 2. Harmonics: Tape (with its Overdrive switch) and Exciter side by side
+    // 2. Harmonics: Sub Bass, Tape and Overdrive side by side (each runs on its own, then they are summed)
+    harmonics.add (knob ("subBass", "Sub Bass"));
     harmonics.add (knob ("tapeAmount", "Tape"));
-    harmonics.add (toggle ("tapeOD", "Overdrive", "OFF", "ON"));
-    harmonics.add (knob ("air", "Exciter"));
-    harmonics.setColumnWeights ({ 4, 3, 4 });
-    harmonics.setSplitMeter (true, true);   // left bar: tape, right bar: exciter
+    harmonics.add (knob ("odMix", "Overdrive"));
+    harmonics.setSplitMeter (true, true);
+    harmonics.setTripleMeter (true);   // three bars, one per knob: sub bass, tape, overdrive
     bindEnable (harmonics, "colorOn");
 
     // 3. Vintage EQ — laid out like the hardware: low section on top, high section below.
@@ -783,6 +809,7 @@ BassChainEditor::BassChainEditor (BassChainProcessor& p)
     {
         auto sw = std::make_unique<ui::SegmentedSwitch> (*mf);
         sw->setVertical (true);
+        sw->setReversed (true);   // 300 Hz on top, 200 Hz at the bottom
         auto lc = std::make_unique<ui::LabeledControl> ("Mono Below", std::move (sw), true, 90);
         lc->setControlHeight (96);
         stereo.add (std::move (lc));
@@ -794,7 +821,7 @@ BassChainEditor::BassChainEditor (BassChainProcessor& p)
     filters.add (knob ("lpFreq", "Low Pass"));
     bindEnable (filters, "filterOn");
 
-    for (auto* panel : { &rider, &harmonics, &pultec, &limiter, &stereo, &filters })
+    for (auto* panel : { &comp, &harmonics, &pultec, &limiter, &stereo, &filters })
         addAndMakeVisible (panel);
 
     // Global Timing note value, top right. Scroll the mouse wheel over it or click to pick.
@@ -815,12 +842,12 @@ BassChainEditor::BassChainEditor (BassChainProcessor& p)
     sliderAtts.push_back (std::make_unique<APVTS::SliderAttachment> (proc.apvts, "inHpf", inHpfSlider));
     sliderAtts.push_back (std::make_unique<APVTS::SliderAttachment> (proc.apvts, "inLpf", inLpfSlider));
 
-    // Limiter / EQ order switch, top bar
-    if (auto* sp = proc.apvts.getParameter ("swapLim"))
+    // Harmonics / EQ order switch, top bar
+    if (auto* sp = proc.apvts.getParameter ("swapHarm"))
     {
         swapAtt = std::make_unique<juce::ParameterAttachment> (*sp, [this] (float v)
         {
-            swapLed.setToggleState (v > 0.5f, juce::dontSendNotification);   // lit = swapped (limiter first)
+            swapLed.setToggleState (v > 0.5f, juce::dontSendNotification);   // lit = swapped (EQ first)
             applySwap (v > 0.5f);
         });
         swapAtt->sendInitialUpdate();
@@ -895,7 +922,7 @@ void BassChainEditor::timerCallback()
     if (lastAccentVersion != accentVersion) applyAccentColours();   // another window changed the colour
 
     ui::ModulePanel* panels[BassChainProcessor::kNumStages] =
-        { &rider, &harmonics, &pultec, &limiter, &stereo, &filters };
+        { &comp, &harmonics, &pultec, &limiter, &stereo, &filters };
 
     for (int s = 0; s < BassChainProcessor::kNumStages; ++s)
     {
@@ -909,6 +936,11 @@ void BassChainEditor::timerCallback()
         shownActivity2[s] = juce::jmax (proc.activity2[s].exchange (0.0f), shownActivity2[s] * 0.82f);
         if (shownActivity2[s] < 0.01f) shownActivity2[s] = 0.0f;
         panels[s]->setActivity2 (shownActivity2[s]);
+
+        // Middle bar of triple meters (ignored by panels without one)
+        shownActivity3[s] = juce::jmax (proc.activity3[s].exchange (0.0f), shownActivity3[s] * 0.82f);
+        if (shownActivity3[s] < 0.01f) shownActivity3[s] = 0.0f;
+        panels[s]->setActivity3 (shownActivity3[s]);
     }
 
 
@@ -1343,8 +1375,8 @@ void BassChainEditor::showColourMenu()
 void BassChainEditor::applySwap (bool s)
 {
     swapped = s;
-    pultec.setNumber  (s ? "4" : "3");
-    limiter.setNumber (s ? "3" : "4");
+    harmonics.setNumber (s ? "3" : "2");
+    pultec.setNumber    (s ? "2" : "3");
     if (getWidth() > 0) resized();
     repaint();
 }
@@ -1482,7 +1514,7 @@ void BassChainEditor::paint (juce::Graphics& g)
     g.drawText ("INPUT LPF", capLpf,      juce::Justification::centredRight);
     g.drawText ("TIMING",    capTiming,   juce::Justification::centredRight);
     g.drawText ("PRESET",    capPreset,   juce::Justification::centredRight);
-    g.drawText ("LIMIT/EQ SWAP", capSwap, juce::Justification::centredRight);
+    g.drawText ("HARMONIC/EQ SWAP", capSwap, juce::Justification::centredRight);
     g.drawText ("AUTO GAIN", capAutoGain, juce::Justification::centredRight);
 
     // Thin divider under the top bar
@@ -1496,7 +1528,7 @@ void BassChainEditor::resized()
     auto top = r.removeFromTop (52).reduced (8, 4);
     hdrDivider = { r.getX() + 8, r.getY() - 1, r.getWidth() - 16, 1 };
 
-    // One row. Right side (right to left): presets, auto gain, then the limiter/EQ order switch.
+    // One row. Right side (right to left): presets, auto gain, then the harmonics/EQ order switch.
     colourButton.setBounds (top.removeFromRight (24).withSizeKeepingCentre (24, 28));
     top.removeFromRight (4);
     saveButton.setBounds (top.removeFromRight (58).withSizeKeepingCentre (58, 28));
@@ -1507,8 +1539,8 @@ void BassChainEditor::resized()
     autoGainButton.setBounds (top.removeFromRight (26).withSizeKeepingCentre (26, 26));
     capAutoGain = top.removeFromRight (72);
     top.removeFromRight (8);
-    swapLed.setBounds (top.removeFromRight (26).withSizeKeepingCentre (26, 26));   // limiter / EQ order
-    capSwap = top.removeFromRight (110);
+    swapLed.setBounds (top.removeFromRight (26).withSizeKeepingCentre (26, 26));   // harmonics / EQ order
+    capSwap = top.removeFromRight (130);
 
     // Left side (left to right): bypass light, input HPF, input LPF, timing + project tempo.
     capBypass = top.removeFromLeft (56);
@@ -1543,21 +1575,21 @@ void BassChainEditor::resized()
         insertPosBox.setBounds (strip.removeFromLeft (200));
     }
 
-    // One row of stages, in signal order. The Vintage EQ and Limiter trade places when swapped.
+    // One row of stages, in signal order. The Harmonics and Vintage EQ trade places when swapped.
     auto row = r;
     const int w = row.getWidth();
-    rider.setBounds     (row.removeFromLeft (w * 19 / 100));
-    harmonics.setBounds (row.removeFromLeft (w * 19 / 100));
+    comp.setBounds (row.removeFromLeft (w * 14 / 100));
     if (swapped)
     {
-        limiter.setBounds (row.removeFromLeft (w * 10 / 100));
-        pultec.setBounds  (row.removeFromLeft (w * 29 / 100));
+        pultec.setBounds    (row.removeFromLeft (w * 29 / 100));
+        harmonics.setBounds (row.removeFromLeft (w * 24 / 100));
     }
     else
     {
-        pultec.setBounds  (row.removeFromLeft (w * 29 / 100));
-        limiter.setBounds (row.removeFromLeft (w * 10 / 100));
+        harmonics.setBounds (row.removeFromLeft (w * 24 / 100));
+        pultec.setBounds    (row.removeFromLeft (w * 29 / 100));
     }
+    limiter.setBounds (row.removeFromLeft (w * 10 / 100));
     stereo.setBounds  (row.removeFromLeft (w * 9 / 100));
     filters.setBounds (row);
 }

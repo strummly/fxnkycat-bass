@@ -51,7 +51,7 @@ struct Biquad
         a1 = (float) (A1 / A0); a2 = (float) (A2 / A0);
     }
 
-    static double clampFreq (double f, double fs) { return std::clamp (f, 10.0, 0.45 * fs); }
+    static double clampFreq (double f, double fs) { return std::clamp (f, 2.0, 0.45 * fs); }
 
     void makePeak (double fs, double f, double q, double db)
     {
@@ -107,92 +107,96 @@ struct Biquad
     }
 };
 
-//==============================================================================
-// 1. Rider (level rider in the style of NoiseWorks GainAim)
-// Two parts, both stereo-linked:
-//   - Ride: a loudness average of the singing only (gaps and breaths are left out)
-//     moves the gain so the voice sits at the Target. Its speed comes from the
-//     speed mode. While the voice is under the noise floor, the ride holds still,
-//     so it never jumps up at the start of the next phrase.
-//   - Noise floor: a fast (20 ms) level check. Anything under the floor (breaths,
-//     room noise, bleed) is pulled down by as much as it is under, up to 12 dB.
-// Speed modes:
-//   Natural  - follows phrases (Timing note: 1x average, 1/4x down, 1x up), +/-12 dB
-//   Balanced - slow, evens out sections (4x average, 1x down, 4x up), +/-12 dB
-//   Fast     - follows words (50 ms / 10 ms / 50 ms), +/-12 dB
-struct VolumeRider
+// Soft-knee compressor curve. Returns gain reduction in dB (positive number).
+inline float computeGR (float levelDb, float threshDb, float ratio, float kneeDb)
 {
-    static constexpr float kFloorDepthDb = 12.0f;
+    const float over  = levelDb - threshDb;
+    const float slope = 1.0f - 1.0f / ratio;
+    if (kneeDb > 0.0f && 2.0f * std::abs (over) <= kneeDb)
+    {
+        const float t = over + kneeDb * 0.5f;
+        return slope * t * t / (2.0f * kneeDb);
+    }
+    return over > 0.0f ? slope * over : 0.0f;
+}
 
-    float ms = 0, fastMs = 0, rideDb = 0, floorDb = 0;
-    float meter = 0;       // largest total gain change (dB, either direction) since last read
-    float overMeter = 0;   // most the level went over the noise floor (dB) since last read
-    float rmsC = 0, downC = 0, upC = 0, maxRangeDb = 12.0f;
-    float fastC = 0, floorDownC = 0, floorUpC = 0;
-    double fs = 44100, lastBeat = -1;
-    int    lastMode = -1;
+//==============================================================================
+// 1. Opto compressor (LA-2A style), stereo-linked.
+//   - Peak Reduction knob (0-100) sets the threshold (0 to -40 dB); ratio 3:1 or 4:1,
+//     6 dB soft knee, RMS detection (10 ms).
+//   - Attack 50 ms.
+//   - Two-stage, program-dependent release like an opto cell, timed from the tempo:
+//     a fast part over 1/2 of the Timing note (1/8 note at the default 1/4), plus a
+//     slow part that builds up during long, sustained compression (~1 s) and lets go
+//     over 4 x the note (one bar in 4/4).
+//   - Gain matched: the output is kept as loud as the input (~1 s averages, 0 to
+//     +24 dB, held during silence), so it only evens the level out.
+struct OptoComp
+{
+    static constexpr float kKneeDb = 6.0f, kMaxMakeupDb = 24.0f;
+
+    double fs = 44100, lastUnit = -1;
+    float rmsMs = 0, rmsC = 0;
+    float fastGr = 0, slowGr = 0, attC = 0, relFastC = 0, slowAttC = 0, relSlowC = 0;
+    float inAvg = 0, outAvg = 0, avgC = 0, makeupDb = 0, mkC = 0;
+    float meter = 0;   // most gain reduction (dB) since last read
 
     void prepare (double sampleRate)
     {
         fs = sampleRate;
-        lastBeat = -1; lastMode = -1;
-        setTiming (0.5, 0);
-        fastC      = timeCoef (0.020, fs);   // noise-floor detector: 20 ms
-        floorDownC = timeCoef (0.015, fs);   // duck noise over 15 ms
-        floorUpC   = timeCoef (0.005, fs);   // let the voice back in over 5 ms
-        ms = fastMs = 0; rideDb = floorDb = 0;
+        rmsC = timeCoef (0.010, fs);
+        attC = timeCoef (0.050, fs);
+        slowAttC = timeCoef (1.0, fs);
+        avgC = timeCoef (1.0, fs);
+        mkC  = timeCoef (0.5, fs);
+        lastUnit = -1;
+        setTiming (0.5);
+        rmsMs = fastGr = slowGr = inAvg = outAvg = makeupDb = meter = 0;
     }
 
-    // 'beat' = the plugin's Timing note in seconds (Rider and Leveler follow it).
-    void setTiming (double beat, int mode)
+    // 'unit' = the top-bar Timing note in seconds.
+    void setTiming (double unit)
     {
-        if (beat == lastBeat && mode == lastMode) return;
-        lastBeat = beat; lastMode = mode;
-
-        double avg, down, up;
-        switch (mode)
-        {
-            case 1:  avg = beat * 4.0; down = beat;        up = beat * 4.0; maxRangeDb = 12.0f; break;  // Balanced
-            case 2:  avg = 0.050;      down = 0.010;       up = 0.050;      maxRangeDb = 12.0f; break;  // Fast
-            default: avg = beat;       down = beat * 0.25; up = beat;       maxRangeDb = 12.0f; break;  // Natural
-        }
-        rmsC  = timeCoef (avg,  fs);
-        downC = timeCoef (down, fs);
-        upC   = timeCoef (up,   fs);
+        if (unit == lastUnit) return;
+        lastUnit = unit;
+        relFastC = timeCoef (std::max (0.02, unit * 0.5), fs);
+        relSlowC = timeCoef (std::max (0.2,  unit * 4.0), fs);
     }
 
-    void process (float* const* ch, int nch, int n, float floorThreshDb, float targetDb)
+    void process (float* const* ch, int nch, int n, float peakReduction, float ratio)
     {
+        const float threshDb = -0.4f * std::clamp (peakReduction, 0.0f, 100.0f);
         for (int i = 0; i < n; ++i)
         {
             float p = 0;
             for (int c = 0; c < nch; ++c) p += ch[c][i] * ch[c][i];
             p /= (float) nch;
 
-            fastMs = fastC * fastMs + (1.0f - fastC) * p;
-            const float fastDb = 10.0f * std::log10 (fastMs + 1.0e-12f);
-            const bool  voice  = fastDb > floorThreshDb;
+            rmsMs = rmsC * rmsMs + (1.0f - rmsC) * p;
+            const float lvl = 10.0f * std::log10 (rmsMs + 1.0e-12f);
+            const float target = computeGR (lvl, threshDb, ratio, kKneeDb);
 
-            // Ride: only listens to (and moves during) the singing.
-            if (voice)
+            fastGr = target > fastGr ? attC * fastGr + (1.0f - attC) * target
+                                     : relFastC * fastGr + (1.0f - relFastC) * target;
+            slowGr = fastGr > slowGr ? slowAttC * slowGr + (1.0f - slowAttC) * fastGr
+                                     : relSlowC * slowGr + (1.0f - relSlowC) * fastGr;
+            const float grDb = std::max (fastGr, slowGr);
+            meter = std::max (meter, grDb);
+
+            const float g = dbToGain (-grDb);
+
+            // Gain match: keep the output as loud as the input (held during silence).
+            if (lvl > -60.0f)
             {
-                overMeter = std::max (overMeter, fastDb - floorThreshDb);
-                ms = ms <= 0.0f ? fastMs : rmsC * ms + (1.0f - rmsC) * p;   // start from the first word's level
-                const float levelDb = 10.0f * std::log10 (ms + 1.0e-12f);
-                const float want = std::clamp (targetDb - levelDb, -maxRangeDb, maxRangeDb);
-                const float c = want < rideDb ? downC : upC;
-                rideDb = c * rideDb + (1.0f - c) * want;
+                inAvg  = avgC * inAvg  + (1.0f - avgC) * p;
+                outAvg = avgC * outAvg + (1.0f - avgC) * p * g * g;
             }
+            const float mkTarget = (inAvg > 1.0e-9f && outAvg > 1.0e-9f)
+                                     ? std::clamp (10.0f * std::log10 (inAvg / outAvg), 0.0f, kMaxMakeupDb) : 0.0f;
+            makeupDb = mkC * makeupDb + (1.0f - mkC) * mkTarget;
 
-            // Noise floor: pull down by how far under the floor, up to 12 dB.
-            const float floorWant = voice ? 0.0f : std::max (-kFloorDepthDb, fastDb - floorThreshDb);
-            const float fc = floorWant < floorDb ? floorDownC : floorUpC;
-            floorDb = fc * floorDb + (1.0f - fc) * floorWant;
-
-            const float totalDb = rideDb + floorDb;
-            meter = std::max (meter, std::abs (totalDb));
-            const float g = dbToGain (totalDb);
-            for (int ch_ = 0; ch_ < nch; ++ch_) ch[ch_][i] *= g;
+            const float total = g * dbToGain (makeupDb);
+            for (int c = 0; c < nch; ++c) ch[c][i] *= total;
         }
     }
 };
@@ -282,7 +286,7 @@ struct PultecEQ
 };
 
 //==============================================================================
-// Tape saturation (first half of stage 2, Harmonics; the "Tape" knob).
+// Tape saturation (stage 2, Harmonics: the main path, "Tape" knob).
 // Drive pushes the signal into an asymmetric soft clipper (tape-style even +
 // odd harmonics), with a gentle low "head bump" and high-frequency roll-off that
 // both grow with the amount. Output level is compensated so louder != better.
@@ -358,7 +362,7 @@ struct TapeSaturation
 };
 
 //==============================================================================
-// 5. Filters: high-pass + low-pass, 24 dB/octave each (two cascaded Butterworth stages).
+// 6. Filters: high-pass (0 Hz = off) + low-pass, 24 dB/octave each (two cascaded Butterworth stages).
 struct PassFilters
 {
     static constexpr double kQ1 = 0.5411961, kQ2 = 1.3065630;  // 4th-order Butterworth
@@ -376,6 +380,7 @@ struct PassFilters
 
     void process (float* const* ch, int nch, int n, float hpHz, float lpHz)
     {
+        const bool useHp = hpHz >= 1.0f;   // 0 Hz = no high-pass
         if (hpHz != lastHp) { lastHp = hpHz; hp1.makeHighPass (fs, hpHz, kQ1); hp2.makeHighPass (fs, hpHz, kQ2); }
         if (lpHz != lastLp) { lastLp = lpHz; lp1.makeLowPass (fs, lpHz, kQ1);  lp2.makeLowPass (fs, lpHz, kQ2); }
 
@@ -383,7 +388,10 @@ struct PassFilters
         {
             float* d = ch[c];
             for (int i = 0; i < n; ++i)
-                d[i] = lp2.process (lp1.process (hp2.process (hp1.process (d[i], c), c), c), c);
+            {
+                const float x = useHp ? hp2.process (hp1.process (d[i], c), c) : d[i];
+                d[i] = lp2.process (lp1.process (x, c), c);
+            }
         }
     }
 };
@@ -438,75 +446,194 @@ struct InputLowPass
 };
 
 //==============================================================================
-// Harmonic exciter (second half of stage 2, Harmonics; the "Exciter" knob), 0-100 %.
-// Takes the top of the bass (above 1.5 kHz: string, pick and fret detail),
-// normalises it to a steady level so it works the same on quiet and loud notes,
-// bends it through a soft asymmetric curve to create new upper harmonics, keeps only
-// what lands above 3 kHz, and blends that in. Adds bite and definition without the
-// harshness of a plain treble boost.
-struct Exciter
-{
-    static constexpr float  kLevel = 2.0f;      // blend at 100 %
-    static constexpr double kInHz  = 1500.0;    // top of the bass that gets excited
-    static constexpr double kOutHz = 3000.0;    // new harmonics kept above this
+// Stage 2, Harmonics: three paths that each take the stage's input on their own and
+// are then added together:  out = Tape(in) + Sub * SubOctave(in) + Overdrive * FundDrive(in).
+// Tape is the main path (at 0 it is the dry signal). SubOctave and FundDrive return
+// only their own new layer ("wet only"), which the knob blends in. Both layers are made
+// from the fundamental alone (the note itself, not the string's upper harmonics).
 
-    Biquad inHp1, inHp2, genHp1, genHp2;
-    float  env[kMaxCh] {}, envAtt = 0, envRel = 0, lastAmt = 0;
+// Fundamental tracker shared by the two layers. Works on the mid (L+R).
+//   - The fundamental is isolated with a 300 Hz low-pass (24 dB/oct).
+//   - Its level is followed (1 ms up, 50 ms down).
+//   - Rising zero crossings (re-armed only after the wave has gone below -25 % of its
+//     level, so the string's harmonics can't add extra crossings) give the note's
+//     period, to a fraction of a sample. Periods outside 25-400 Hz are ignored.
+struct FundamentalTracker
+{
+    Biquad lp1, lp2;
+    float  f = 0, prev = 0, env = 0, envAtt = 0, envRel = 0;
+    bool   armed = false;
+    double sinceCross = 0;   // samples since the last rising crossing
+    double period = 0;       // last good period (samples), 0 = none yet
+    bool   crossed = false;  // a rising crossing happened on this sample
+    double crossFrac = 0;    // how far back in this sample it happened (0-1)
     double fs = 44100;
 
     void prepare (double sampleRate)
     {
         fs = sampleRate;
-        inHp1.makeHighPass (fs, kInHz, 0.707);   inHp2.makeHighPass (fs, kInHz, 0.707);
-        genHp1.makeHighPass (fs, kOutHz, 0.707); genHp2.makeHighPass (fs, kOutHz, 0.707);
-        for (auto* b : { &inHp1, &inHp2, &genHp1, &genHp2 }) b->reset();
-        envAtt = timeCoef (0.001, fs); envRel = timeCoef (0.030, fs);
-        for (int c = 0; c < kMaxCh; ++c) env[c] = 0;
-        lastAmt = 0;
-        eIn = eAdd = 0;
+        lp1.makeLowPass (fs, 300.0, PassFilters::kQ1); lp2.makeLowPass (fs, 300.0, PassFilters::kQ2);
+        lp1.reset(); lp2.reset();
+        f = prev = env = 0; armed = false; sinceCross = 0; period = 0; crossed = false;
+        envAtt = timeCoef (0.001, fs); envRel = timeCoef (0.050, fs);
     }
 
-    void process (float* const* ch, int nch, int n, float amount)
+    void step (float x)
     {
-        const float a = std::clamp (amount * 0.01f, 0.0f, 1.0f);
-        const float a0 = lastAmt;
-        lastAmt = a;
+        prev = f;
+        f = lp2.process (lp1.process (x, 0), 0);
+        env = follow (env, std::abs (f), envAtt, envRel);
+        sinceCross += 1.0;
+        crossed = false;
 
-        for (int c = 0; c < nch; ++c)
+        if (f < -0.25f * env) armed = true;
+        if (armed && prev < 0.0f && f >= 0.0f && env > 1.0e-4f)
         {
-            float* d = ch[c];
-            for (int i = 0; i < n; ++i)
-            {
-                const float x = d[i];
-                eIn += (double) x * x;
-                if (a <= 0.0f && a0 <= 0.0f) continue;   // knob at 0: nothing to add
-                const float am = a0 + (a - a0) * (float) (i + 1) / (float) n;   // smoothed (no zipper noise)
-                const float band = inHp2.process (inHp1.process (x, c), c);
-                env[c] = follow (env[c], std::abs (band), envAtt, envRel);
-                const float u   = band / (env[c] + 1.0e-6f);              // steady level, ~ +/-1
-                const float th  = std::tanh (3.0f * u);
-                const float gen = (th + 0.3f * th * th) * env[c];         // asymmetric -> odd + even harmonics
-                const float top = genHp2.process (genHp1.process (gen, c), c);
-                const float added = top * am * kLevel;
-                eAdd += (double) added * added;
-                d[i] = x + added;
-            }
+            armed = false;
+            crossFrac = (double) f / ((double) f - (double) prev + 1.0e-12);   // 0 = exactly now
+            const double p = sinceCross - crossFrac;
+            if (p >= fs / 400.0 && p <= fs / 25.0) period = p;
+            sinceCross = crossFrac;
+            crossed = true;
         }
     }
+};
 
-    // How loud the added harmonics are, in dB relative to the input. Resets the sums.
-    double eIn = 0, eAdd = 0;
-    float takeMeter (int samples)
+// Sub octave layer (the "Sub Bass" knob, 0-100 % = how much is added).
+// A pure sine exactly one octave below the fundamental, and nothing else: a sine
+// oscillator runs at half the tracked note frequency and is phase-locked to every
+// other zero crossing of the fundamental, so it follows the notes as they change.
+// Its level follows the fundamental's, so it replicates the playing; at 100 % the sub
+// is about as loud as the original fundamental. A shallow low-pass (6 dB/oct) at the
+// Stereo stage's Mono Below frequency (200 / 250 / 300 Hz; it follows that setting even
+// when the Stereo stage is off) rounds off the top of the sub. The same on both channels.
+struct SubOctave
+{
+    FundamentalTracker trk;
+    double phase = 0, fs = 44100;   // phase in cycles, 0-1
+    float  amp = 0, ampC = 0;
+    float  lpY = 0, lpA = 0, lastLp = -1;   // one-pole low-pass (6 dB/oct)
+    bool   evenCross = false;
+
+    void prepare (double sampleRate)
     {
-        const float db = eIn / std::max (1, samples) < 1.0e-7 ? -200.0f
-                       : 10.0f * std::log10 ((float) (eAdd / eIn) + 1.0e-12f);
-        eIn = eAdd = 0;
-        return db;
+        fs = sampleRate;
+        trk.prepare (sampleRate);
+        phase = 0; amp = 0; evenCross = false;
+        ampC = timeCoef (0.003, sampleRate);   // smooths the level (no zipper / clicks)
+        lpY  = 0; lastLp = -1;
+        setLowPass (250.0f);
+    }
+
+    void setLowPass (float hz)
+    {
+        if (hz == lastLp) return;
+        lastLp = hz;
+        lpA = (float) std::exp (-2.0 * kPi * hz / fs);
+    }
+
+    // In place: dry input -> sub octave layer only. lpHz = the Stereo stage's Mono Below frequency.
+    void process (float* const* ch, int nch, int n, float lpHz)
+    {
+        setLowPass (lpHz);
+        for (int i = 0; i < n; ++i)
+        {
+            float x = 0;
+            for (int c = 0; c < nch; ++c) x += ch[c][i];
+            trk.step (x / (float) nch);
+
+            const double inc = trk.period > 0 ? 0.5 / trk.period : 0.0;   // half the note's frequency
+            phase += inc;
+            if (trk.crossed && trk.period > 0)
+            {
+                // Lock: every other crossing should land at phase 0, the ones between at 0.5
+                // (plus the bit of this sample that has passed since the crossing).
+                evenCross = ! evenCross;
+                const double want = (evenCross ? 0.0 : 0.5) + trk.crossFrac * inc;
+                double err = want - phase;
+                err -= std::floor (err + 0.5);       // wrap to -0.5 .. 0.5
+                phase += 0.25 * err;                 // gentle pull, so note changes glide in
+            }
+            phase -= std::floor (phase);
+
+            amp = ampC * amp + (1.0f - ampC) * (trk.period > 0 ? trk.env : 0.0f);
+            const float sine = amp * (float) std::sin (2.0 * kPi * phase);
+            lpY = (1.0f - lpA) * sine + lpA * lpY;   // shallow low-pass at the Mono Below frequency
+            for (int c = 0; c < nch; ++c) ch[c][i] = lpY;
+        }
+    }
+};
+
+// Saturation layer (the "Overdrive" knob, 0-100 % = how much is added).
+// Only the fundamental is saturated: it is taken at a steady level and pushed gently
+// (+6 dB) into a soft, slightly biased tube-style curve, which rounds the wave and adds
+// mostly low, warm harmonics (2nd, 3rd, 4th...) rather than the buzz of hard clipping.
+// Only part of what comes out is kept (gentle 12 dB/oct filters each side):
+//   - High-pass at the Stereo stage's Mono Below frequency (200 / 250 / 300 Hz), so the
+//     layer stays out of the mono low end. It follows that setting even when the
+//     Stereo stage is off.
+//   - Low-pass that moves with the Overdrive knob: 2 kHz when the knob is barely up,
+//     sliding down to 800 Hz at 100 %, so more saturation gets darker instead of fizzier.
+// The string's own upper harmonics are left alone. The layer's level follows the
+// fundamental, so it replicates the playing. The same on both channels.
+struct FundDrive
+{
+    static constexpr double kLpTopHz = 2000.0, kLpBottomHz = 800.0;
+    static constexpr float  kDriveDb = 6.0f;
+    static constexpr float  kBias    = 0.2f;   // slight asymmetry -> warm even harmonics
+    static constexpr float  kLevel   = 2.5f;   // at 100 %: the layer peaks about as high as the note (less on very low notes)
+
+    FundamentalTracker trk;
+    Biquad hp, lp;   // 12 dB/oct each
+    double fs = 44100;
+    float  lastHp = -1, lastLp = -1;
+
+    void prepare (double sampleRate)
+    {
+        fs = sampleRate;
+        trk.prepare (sampleRate);
+        hp.reset(); lp.reset();
+        lastHp = lastLp = -1;
+        setFilters (0.0f, 250.0f);
+    }
+
+    // mix 0-1 (the Overdrive knob), hpHz = the Stereo stage's Mono Below frequency.
+    void setFilters (float mix, float hpHz)
+    {
+        const float lpHz = (float) (kLpTopHz * std::pow (kLpBottomHz / kLpTopHz, (double) std::clamp (mix, 0.0f, 1.0f)));
+        if (hpHz != lastHp) { lastHp = hpHz; hp.makeHighPass (fs, hpHz, 0.70710678); }
+        if (std::abs (lpHz - lastLp) > 0.5f) { lastLp = lpHz; lp.makeLowPass (fs, lpHz, 0.70710678); }
+    }
+
+    // Soft tube-style curve: biased tanh, centred and scaled so small signals pass at unity.
+    static inline float soft (float x)
+    {
+        const float t0 = std::tanh (kBias);
+        return (std::tanh (x + kBias) - t0) / (1.0f - t0 * t0);
+    }
+
+    // In place: dry input -> distorted-fundamental layer only.
+    void process (float* const* ch, int nch, int n, float mix, float hpHz)
+    {
+        setFilters (mix, hpHz);
+        const float drive = dbToGain (kDriveDb);
+        for (int i = 0; i < n; ++i)
+        {
+            float x = 0;
+            for (int c = 0; c < nch; ++c) x += ch[c][i];
+            trk.step (x / (float) nch);
+
+            const float u = trk.f / (trk.env + 1.0e-6f);              // steady level, ~ +/-1
+            const float y = soft (u * drive);
+            const float band = lp.process (hp.process (y, 0), 0);
+            const float out = band * trk.env * kLevel;
+            for (int c = 0; c < nch; ++c) ch[c][i] = out;
+        }
     }
 };
 
 //==============================================================================
-// 4. Limiter (after the Vintage EQ, or before it with LIMIT/EQ SWAP).
+// 4. Limiter (after the Harmonics and Vintage EQ, in either HARMONIC/EQ SWAP order).
 // Stereo-linked brickwall peak limiter with 2 ms look-ahead:
 //   - every sample works out the gain it needs to stay under the threshold,
 //   - the lowest of those over the look-ahead window is held, then averaged over the

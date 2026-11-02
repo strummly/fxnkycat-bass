@@ -44,9 +44,9 @@ juce::StringArray BassChainProcessor::divisionNames()
 // External plugin insert
 juce::StringArray BassChainProcessor::insertPositionNames()
 {
-    // By stage name. "After Vintage EQ" / "After Limiter" follow those stages whichever
-    // order LIMIT/EQ SWAP puts them in. No "after Filters": that is just after the plugin.
-    return { "After Rider", "After Harmonics", "After Vintage EQ", "After Limiter", "After Stereo" };
+    // By stage name. "After Harmonics" / "After Vintage EQ" follow those stages whichever
+    // order HARMONIC/EQ SWAP puts them in. No "after Filters": that is just after the plugin.
+    return { "After Compressor", "After Harmonics", "After Vintage EQ", "After Limiter", "After Stereo" };
 }
 
 BassChainProcessor::~BassChainProcessor()
@@ -192,16 +192,16 @@ APVTS::ParameterLayout BassChainProcessor::createLayout()
 {
     APVTS::ParameterLayout l;
 
-    // Input high-pass (before stage 1). Lowest setting (20 Hz) = Off.
+    // Input high-pass (before stage 1). Lowest setting (0 Hz) = Off.
     {
-        juce::NormalisableRange<float> r (20.0f, 500.0f, 1.0f);
+        juce::NormalisableRange<float> r (0.0f, 500.0f, 1.0f);
         r.setSkewForCentre (100.0f);
         l.add (std::make_unique<juce::AudioParameterFloat> (
-            juce::ParameterID { "inHpf", 1 }, "Input High Pass", r, 20.0f,
+            juce::ParameterID { "inHpf", 1 }, "Input High Pass", r, 0.0f,
             juce::AudioParameterFloatAttributes()
                 .withLabel ("Hz")
                 .withStringFromValueFunction ([] (float v, int) { return v <= kInHpfOffHz ? juce::String ("Off") : juce::String (juce::roundToInt (v)) + " Hz"; })
-                .withValueFromStringFunction ([] (const juce::String& s) { return s.trim().equalsIgnoreCase ("off") ? 20.0f : s.getFloatValue(); })));
+                .withValueFromStringFunction ([] (const juce::String& s) { return s.trim().equalsIgnoreCase ("off") ? 0.0f : s.getFloatValue(); })));
     }
 
     // Input low-pass (before stage 1, right of the high-pass). Highest setting (20 kHz) = Off.
@@ -230,22 +230,21 @@ APVTS::ParameterLayout BassChainProcessor::createLayout()
     l.add (bparam ("bypass", "Bypass", false));   // whole plugin; also the DAW's own bypass
     // External plugin insert: on/off and which stage it comes after
     l.add (bparam ("insertOn", "Insert On", false));   // switched on when a plugin is added
-    l.add (cparam ("insertPos", "Insert After", insertPositionNames(), 0));   // default: after the Rider
+    l.add (cparam ("insertPos", "Insert After", insertPositionNames(), 0));   // default: after the Compressor
 
     // Global timing note value. Tempo itself comes from the project (host).
     l.add (cparam ("division", "Timing", divisionNames(), 6));   // default 1/4
 
-    // 1. Rider
-    l.add (bparam ("riderOn", "Rider On", false));
-    l.add (fparam ("riderThresh", "Rider Noise Floor", -60.0f, 0.0f, 0.0f, "dB"));
-    l.add (fparam ("riderTarget", "Rider Target", -40.0f, 0.0f, -18.0f, "dB"));
-    l.add (cparam ("riderMode", "Rider Speed", { "Natural", "Balanced", "Fast" }, 0));
+    // 1. Opto compressor (LA-2A style): peak reduction, 3:1 / 4:1, 50 ms attack, tempo release, gain matched
+    l.add (bparam ("compOn", "Compressor On", false));
+    l.add (fparam ("compPeak", "Peak Reduction", 0.0f, 100.0f, 0.0f, "", 1.0f));
+    l.add (cparam ("compRatio", "Compressor Ratio", { "2:1", "3:1", "4:1" }, 1));   // default 3:1
 
-    // 2. Harmonics: tape saturation (+ overdrive) and exciter
+    // 2. Harmonics: sub octave, tape saturation and mid overdrive, processed in parallel and summed
     l.add (bparam ("colorOn", "Harmonics On", false));
+    l.add (fparam ("subBass", "Sub Bass", 0.0f, 100.0f, 0.0f, "%", 1.0f));
     l.add (fparam ("tapeAmount", "Tape", 0.0f, 100.0f, 0.0f, "%", 1.0f));
-    l.add (bparam ("tapeOD", "Tape Overdrive", false));
-    l.add (fparam ("air", "Exciter", 0.0f, 100.0f, 0.0f, "%", 1.0f));
+    l.add (fparam ("odMix", "Overdrive", 0.0f, 100.0f, 0.0f, "%", 1.0f));
 
     // 3. Vintage EQ (Pultec EQP-1A style)
     l.add (bparam ("pultecOn", "Pultec On", false));
@@ -259,8 +258,8 @@ APVTS::ParameterLayout BassChainProcessor::createLayout()
     l.add (cparam ("pHighAttFreq", "Atten Select", { "5 kHz", "10 kHz", "20 kHz" }, 1));
     l.add (fparam ("pHighAtten", "High Atten", 0.0f, 10.0f, 0.0f, "", 0.1f));
 
-    // Order of stages 3 and 4: false = Vintage EQ then Limiter (default), true = Limiter first
-    l.add (bparam ("swapLim", "Limiter Before EQ", false));
+    // Order of stages 2 and 3: false = Harmonics then Vintage EQ (default), true = EQ first
+    l.add (bparam ("swapHarm", "EQ Before Harmonics", false));
 
     // 4. Limiter: threshold knob; release follows the tempo
     l.add (bparam ("limOn", "Limiter On", false));
@@ -271,16 +270,16 @@ APVTS::ParameterLayout BassChainProcessor::createLayout()
     l.add (cparam ("monoFreq", "Mono Below", { "200 Hz", "250 Hz", "300 Hz" }, 1));   // default 250 Hz
 
     // 6. Filters: high / low pass (log-scaled knobs)
-    auto freqParam = [] (const char* id, const char* name, float lo, float hi, float def)
+    auto freqParam = [] (const char* id, const char* name, float lo, float hi, float centre, float def)
     {
         juce::NormalisableRange<float> r (lo, hi, 1.0f);
-        r.setSkewForCentre (std::sqrt (lo * hi));
+        r.setSkewForCentre (centre);
         return std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { id, 1 }, name, r, def,
                                                             juce::AudioParameterFloatAttributes().withLabel ("Hz"));
     };
     l.add (bparam ("filterOn", "Filter On", false));
-    l.add (freqParam ("hpFreq", "High Pass", 20.0f, 1000.0f, 20.0f));
-    l.add (freqParam ("lpFreq", "Low Pass", 2000.0f, 20000.0f, 20000.0f));
+    l.add (freqParam ("hpFreq", "High Pass", 0.0f, 1000.0f, 100.0f, 0.0f));          // 0 Hz = no high-pass
+    l.add (freqParam ("lpFreq", "Low Pass", 500.0f, 20000.0f, 3162.0f, 20000.0f));
 
     return l;
 }
@@ -291,10 +290,10 @@ BassChainProcessor::BassChainProcessor()
                           .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "PARAMS", createLayout())
 {
-    riderOn  = p ("riderOn");  colorOn = p ("colorOn"); pultecOn = p ("pultecOn");
+    compOn   = p ("compOn");   colorOn = p ("colorOn"); pultecOn = p ("pultecOn");
     limOn    = p ("limOn");    stereoOn = p ("stereoOn"); filterOn = p ("filterOn");
 
-    swapLim  = p ("swapLim");  inHpf = p ("inHpf"); inLpf = p ("inLpf");
+    swapHarm = p ("swapHarm");  inHpf = p ("inHpf"); inLpf = p ("inLpf");
     autoGain = p ("autoGain"); division = p ("division");
     bypassParam = dynamic_cast<juce::AudioParameterBool*> (apvts.getParameter ("bypass"));
     insertOn    = p ("insertOn");    insertPos   = p ("insertPos");
@@ -302,8 +301,8 @@ BassChainProcessor::BassChainProcessor()
     formatManager.addDefaultFormats();   // VST3 (the only hosting format enabled in the build)
     insertBuf.setSize (16, kChunk);
 
-    riderThresh = p ("riderThresh"); riderTarget = p ("riderTarget"); riderMode = p ("riderMode");
-    tapeAmount  = p ("tapeAmount");  tapeOD      = p ("tapeOD");      air       = p ("air");
+    compPeak    = p ("compPeak");    compRatio   = p ("compRatio");
+    tapeAmount  = p ("tapeAmount");  subBass     = p ("subBass");     odMix     = p ("odMix");
 
     pLowFreq   = p ("pLowFreq");   pLowBoost  = p ("pLowBoost");  pLowAtten    = p ("pLowAtten");
     pHighFreq  = p ("pHighFreq");  pHighBoost = p ("pHighBoost"); pBandwidth   = p ("pBandwidth");
@@ -329,7 +328,7 @@ void BassChainProcessor::updateLatency()
 
 void BassChainProcessor::prepareToPlay (double sr, int samplesPerBlock)
 {
-    rider.prepare (sr);
+    comp.prepare (sr);
     inputHpf.prepare (sr);
     inputLpf.prepare (sr);
     currentRate = sr;
@@ -337,7 +336,9 @@ void BassChainProcessor::prepareToPlay (double sr, int samplesPerBlock)
     wasBypassed = bypassParam != nullptr && bypassParam->get();
     agIn = agOut = 0.0f; agGainDb = 0.0f;
     tape.prepare (sr);
-    exciter.prepare (sr);
+    subOctave.prepare (sr);
+    fundDrive.prepare (sr);
+    lastSubAmt = lastOdAmt = 0.0f;
     pultec.prepare (sr);
     limiter.prepare (sr);
     monoBelow.prepare (sr);
@@ -399,10 +400,10 @@ void BassChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
     const double divBeats = kDivBeats[divIdx] < 0 ? -kDivBeats[divIdx] * beatsPerBar : kDivBeats[divIdx];
     const double unit     = divBeats * quarter;
 
-    rider.setTiming (unit, juce::jlimit (0, 2, (int) riderMode->load()));   // Natural, Balanced, Fast
+    comp.setTiming (unit);   // compressor release: fast part 1/2 note, slow part 4 notes
     limiter.setRelease (unit * 0.25);   // limiter release: a quarter of the Timing note (1/16 note at the default 1/4)
 
-    float stageAct[kNumStages] {}, stageAct2[kNumStages] {};
+    float stageAct[kNumStages] {}, stageAct2[kNumStages] {}, stageAct3[kNumStages] {};
 
     // Change in dB (relative to the input) -> 0-1, same scale as the static stages.
     auto changeAct = [] (float changeDb) { return juce::jlimit (0.0f, 1.0f, juce::jmap (changeDb, -40.0f, -10.0f, 0.0f, 1.0f)); };
@@ -456,29 +457,65 @@ void BassChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
         // External plugin insert: runs right after the stage chosen in "Insert After".
         auto insertAfter = [&] (int pos) { if (insAfter == pos) runInsert (ch, nch, len); };
 
-        // 1. Rider
-        if (on (riderOn))
+        // 1. Opto compressor (meter shows gain reduction)
+        if (on (compOn))
         {
-            rider.process (ch, nch, len, riderThresh->load(), riderTarget->load());
-            stageAct[0] = juce::jmax (stageAct[0], dynAct (rider.meter));
-            // Left bar: how far the level goes over the noise floor, full at 12 dB
-            stageAct2[0] = juce::jmax (stageAct2[0], juce::jlimit (0.0f, 1.0f, rider.overMeter / 12.0f));
-            rider.overMeter = 0;
+            comp.process (ch, nch, len, compPeak->load(), 2.0f + (float) juce::jlimit (0, 2, (int) compRatio->load()));
+            stageAct[0] = juce::jmax (stageAct[0], dynAct (comp.meter));
         }
         insertAfter (0);
 
-        // 2. Harmonics: tape saturation, then the exciter.
-        // Two bars: left = tape (how much it changes the sound), right = exciter (harmonics it adds)
-        if (on (colorOn))
+        // 2/3. Harmonics: Sub Bass, Tape and Overdrive each process the stage's input on their own,
+        // then are added together:  out = Tape(in) + sub x SubOctave(in) + overdrive x FundDrive(in).
+        // Two bars: left = tape (how much it changes the sound), right = sub + overdrive layers added.
+        auto runHarmonics = [&]
         {
-            stageAct2[1] = juce::jmax (stageAct2[1],
-                measureStatic (ch, nch, len, [&] { tape.process (ch, nch, len, tapeAmount->load(), on (tapeOD)); }));
-            exciter.process (ch, nch, len, air->load());
-            stageAct[1] = juce::jmax (stageAct[1], changeAct (exciter.takeMeter (len * nch)));
-        }
-        insertAfter (1);
+            if (! on (colorOn)) return;
 
-        // 3/4. Vintage EQ
+            // Each layer gets its own copy of the input.
+            for (int c = 0; c < nch; ++c)
+            {
+                std::copy (ch[c], ch[c] + len, subBuf[(size_t) c].begin());
+                std::copy (ch[c], ch[c] + len, odBuf[(size_t) c].begin());
+            }
+            float* sub[vc::kMaxCh] = { subBuf[0].data(), subBuf[1].data() };
+            float* od[vc::kMaxCh]  = { odBuf[0].data(),  odBuf[1].data() };
+            // Both layers' filters follow the Stereo stage's Mono Below frequency (even when that
+            // stage is off): the sub's low-pass and the saturation's high-pass. The saturation's
+            // low-pass follows its own knob.
+            const float monoHz = vc::MonoBelow::kFreqs[juce::jlimit (0, 2, (int) monoFreq->load())];
+            subOctave.process (sub, nch, len, monoHz);   // -> sub octave layer only
+            fundDrive.process (od, nch, len, odMix->load() * 0.01f, monoHz);   // -> distorted fundamental only
+
+            // Main path: tape (at 0 this is the untouched input). Middle meter.
+            stageAct3[1] = juce::jmax (stageAct3[1],
+                measureStatic (ch, nch, len, [&] { tape.process (ch, nch, len, tapeAmount->load(), false); }));
+
+            // Sum, with the knobs glided across the chunk so turning them doesn't click
+            const float s1 = juce::jlimit (0.0f, 1.0f, subBass->load() * 0.01f);
+            const float o1 = juce::jlimit (0.0f, 1.0f, odMix->load() * 0.01f);
+            const float s0 = lastSubAmt, o0 = lastOdAmt;
+            lastSubAmt = s1; lastOdAmt = o1;
+            double eIn = 0, eSub = 0, eOd = 0;
+            for (int c = 0; c < nch; ++c)
+                for (int i = 0; i < len; ++i)
+                {
+                    const float t = (float) (i + 1) / (float) len;
+                    const float subAdd = (s0 + (s1 - s0) * t) * sub[c][i];
+                    const float odAdd  = (o0 + (o1 - o0) * t) * od[c][i];
+                    eIn  += (double) stageIn[(size_t) c][(size_t) i] * stageIn[(size_t) c][(size_t) i];
+                    eSub += (double) subAdd * subAdd;
+                    eOd  += (double) odAdd * odAdd;
+                    ch[c][i] += subAdd + odAdd;
+                }
+            // How loud each added layer is, relative to the input
+            auto layerDb = [&] (double e) { return eIn / (double) (len * nch) < 1.0e-7 ? -200.0f
+                                                   : 10.0f * std::log10 ((float) (e / eIn) + 1.0e-12f); };
+            stageAct2[1] = juce::jmax (stageAct2[1], changeAct (layerDb (eSub)));   // left meter: sub bass
+            stageAct[1]  = juce::jmax (stageAct[1],  changeAct (layerDb (eOd)));    // right meter: overdrive
+        };
+
+        // 2/3. Vintage EQ
         auto runPultec = [&]
         {
             if (! on (pultecOn)) return;
@@ -493,17 +530,15 @@ void BassChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
             stageAct[2]  = juce::jmax (stageAct[2],  changeAct (highDb));
         };
 
-        // 3/4. Limiter (always runs so its look-ahead delay is constant; only limits when on).
-        // Meter shows gain reduction.
-        auto runLimiter = [&]
-        {
-            limiter.process (ch, nch, len, limThresh->load(), on (limOn));
-            stageAct[3] = juce::jmax (stageAct[3], dynAct (limiter.meter));
-        };
+        // Order: Harmonics then Vintage EQ (default), or the EQ first when swapped
+        if (on (swapHarm)) { runPultec();    insertAfter (2); runHarmonics(); insertAfter (1); }
+        else               { runHarmonics(); insertAfter (1); runPultec();    insertAfter (2); }
 
-        // Order: Vintage EQ then Limiter (default), or Limiter first when swapped
-        if (on (swapLim)) { runLimiter(); insertAfter (3); runPultec(); insertAfter (2); }
-        else              { runPultec();  insertAfter (2); runLimiter(); insertAfter (3); }
+        // 4. Limiter (always runs so its look-ahead delay is constant; only limits when on).
+        // Meter shows gain reduction.
+        limiter.process (ch, nch, len, limThresh->load(), on (limOn));
+        stageAct[3] = juce::jmax (stageAct[3], dynAct (limiter.meter));
+        insertAfter (3);
 
         // 5. Stereo: mono and centred below 200 / 250 / 300 Hz
         if (on (stereoOn))
@@ -569,6 +604,8 @@ void BassChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
         while (stageAct[s] > prev && ! activity[s].compare_exchange_weak (prev, stageAct[s])) {}
         float prev2 = activity2[s].load();
         while (stageAct2[s] > prev2 && ! activity2[s].compare_exchange_weak (prev2, stageAct2[s])) {}
+        float prev3 = activity3[s].load();
+        while (stageAct3[s] > prev3 && ! activity3[s].compare_exchange_weak (prev3, stageAct3[s])) {}
     }
 }
 

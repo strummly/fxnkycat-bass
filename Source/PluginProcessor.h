@@ -52,12 +52,13 @@ public:
     static juce::StringArray insertPositionNames();
 
     // How hard each stage is working right now, 0-1 (peak since the editor last read it).
-    // Order: rider, harmonics, vintage EQ, limiter, stereo, filters.
+    // Order: compressor, harmonics, vintage EQ, limiter, stereo, filters.
     static constexpr int kNumStages = 6;
     std::atomic<float> activity[kNumStages] {};
     // Second (left-hand) meter for stages with split meters, 0-1:
-    // rider = level over threshold, harmonics = tape, vintage EQ = low boost.
+    // vintage EQ = low boost, harmonics = sub bass (and activity3 = tape, activity = overdrive).
     std::atomic<float> activity2[kNumStages] {};
+    std::atomic<float> activity3[kNumStages] {};   // third (middle) meter: harmonics = tape
 
     BassChainProcessor();
     ~BassChainProcessor() override;
@@ -101,7 +102,7 @@ public:
     void resetToDefaults();                           // "-init-": every setting back to default (bypass untouched)
 
     std::atomic<float> hostBpm { 120.0f };   // project tempo, for display
-    static constexpr float kInHpfOffHz = 20.5f;     // input high-pass at/below this = Off
+    static constexpr float kInHpfOffHz = 0.5f;      // input high-pass at/below this (0 Hz) = Off
     static constexpr float kInLpfOffHz = 19990.0f;  // input low-pass at/above this = Off
     juce::AudioProcessorValueTreeState apvts;
 
@@ -123,13 +124,13 @@ private:
     std::atomic<float> *insertOn = nullptr, *insertPos = nullptr;
 
     // Stage on/off
-    std::atomic<float> *riderOn, *colorOn, *pultecOn, *limOn, *stereoOn, *filterOn;
+    std::atomic<float> *compOn, *colorOn, *pultecOn, *limOn, *stereoOn, *filterOn;
     // Top bar
-    std::atomic<float> *swapLim, *inHpf, *inLpf, *autoGain, *division;
-    // 1 Rider
-    std::atomic<float> *riderThresh, *riderTarget, *riderMode;
-    // 2 Harmonics: tape + exciter
-    std::atomic<float> *tapeAmount, *tapeOD, *air;
+    std::atomic<float> *swapHarm, *inHpf, *inLpf, *autoGain, *division;
+    // 1 Opto compressor
+    std::atomic<float> *compPeak, *compRatio;
+    // 2 Harmonics: sub bass, tape, overdrive (parallel)
+    std::atomic<float> *subBass, *tapeAmount, *odMix;
     // 3 Vintage EQ (Pultec)
     std::atomic<float> *pLowFreq, *pLowBoost, *pLowAtten, *pHighFreq, *pHighBoost,
                        *pBandwidth, *pHighAttFreq, *pHighAtten;
@@ -150,13 +151,15 @@ private:
     float  agIn = 0.0f, agOut = 0.0f, agGainDb = 0.0f;
 
     static constexpr int kChunk = 512;
-    std::array<std::array<float, kChunk>, vc::kMaxCh> stageIn {};
+    std::array<std::array<float, kChunk>, vc::kMaxCh> stageIn {}, subBuf {}, odBuf {};   // scratch (no allocation)
+    float lastSubAmt = 0.0f, lastOdAmt = 0.0f;   // Sub Bass / Overdrive knobs last chunk (for gliding)
 
-    vc::VolumeRider    rider;
+    vc::OptoComp       comp;
     vc::InputHighPass  inputHpf;
     vc::InputLowPass   inputLpf;
     vc::TapeSaturation tape;
-    vc::Exciter        exciter;
+    vc::SubOctave      subOctave;
+    vc::FundDrive      fundDrive;
     vc::PultecEQ       pultec;
     vc::Limiter        limiter;
     vc::MonoBelow      monoBelow;

@@ -156,6 +156,9 @@ namespace ui
         // Single meter bar = setActivity, LED = setActivity2 (e.g. stage 2: bar = de-esser, LED = gate).
         void setLedFromSecond (bool b) { ledFromSecond = b; repaint(); }
         void setActivity2 (float v);
+        // Three bars side by side: left = setActivity2, middle = setActivity3, right = setActivity.
+        void setTripleMeter (bool t) { tripleMeter = t; repaint(); }
+        void setActivity3 (float v);
         void setNumber (const juce::String& n) { if (n != number) { number = n; repaint(); } }
         // Switches stacked in a column on the left, the last control (a knob) on the right.
         void setSideStack (bool s) { sideStack = s; resized(); }
@@ -170,7 +173,8 @@ namespace ui
         juce::Rectangle<float> ledArea() const;
         void turnOnFromControl (const juce::MouseEvent&);
         juce::Rectangle<float> meterArea() const;
-        float activity = 0.0f, activity2 = 0.0f;
+        float activity = 0.0f, activity2 = 0.0f, activity3 = 0.0f;
+        bool  tripleMeter = false;
         bool  splitMeter = false, ledFollowsBoth = false, ledFromSecond = false;
         juce::String number, title, subtitle;
         int rows;
@@ -201,13 +205,14 @@ private:
     BassChainProcessor& proc;
     ui::KnobLookAndFeel lnf;
     float shownActivity2[BassChainProcessor::kNumStages] {};   // left-hand bars of split meters
+    float shownActivity3[BassChainProcessor::kNumStages] {};   // middle bars of triple meters
 
     // Panels first so they are destroyed after the attachments below.
-    ui::ModulePanel rider, harmonics, pultec, limiter, stereo, filters;
+    ui::ModulePanel comp, harmonics, pultec, limiter, stereo, filters;
     juce::ComboBox timingBox;   // global Timing note value (scroll or click)
     juce::Label    bpmLabel;    // shows the project tempo
-    // LIMIT/EQ SWAP light: off = Vintage EQ (3) then Limiter (4), the default; lit = limiter first.
-    // Parameter "swapLim" = limiter first, so the light simply shows it.
+    // HARMONIC/EQ SWAP light: off = Harmonics (2) then Vintage EQ (3), the default; lit = EQ first.
+    // Parameter "swapHarm" = EQ first, so the light simply shows it.
     ui::LedButton swapLed;
     std::unique_ptr<juce::ParameterAttachment> swapAtt;
     bool swapped = false;
